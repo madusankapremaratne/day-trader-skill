@@ -130,7 +130,13 @@ def write_json(path, doc):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, indent=2)
         fh.write("\n")
-    os.replace(tmp, path)   # a reader polling the file never sees half of it
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)   # a reader polling the file never sees half of it
+            return
+        except PermissionError:     # Windows: a reader has it open this instant
+            time.sleep(0.25)
+    os.replace(tmp, path)
 
 
 def read_json(path, default=None):
