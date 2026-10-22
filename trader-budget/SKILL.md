@@ -150,6 +150,24 @@ a separate config (`--config`) for a long-term split.
 - No projections: never say what a trade will make. A target is a plan, not a forecast.
 - Free Yahoo prices are unofficial and can lag. The broker's price is the one that fills.
 
+## Forex (EURUSD) on MT5
+
+An FX plan is sized in lots (the pair's lot step, 0.01), not shares. The
+smallest of these wins, and the report says which one decided:
+
+| Limit | Lots |
+|---|---|
+| max loss | `max_loss_per_trade_usd` / (stop distance x 100,000). 8 pips = $80 a lot, so $50 buys 0.62 lots |
+| max lots | `fx.max_lots` (1.00) |
+| margin | balance minus the cash buffer / margin for one lot at the account's leverage |
+| leverage | `fx.max_leverage_used` (10) x balance / exposure of one lot |
+
+Balance and leverage come from `trader/mt5/account.json` (trader-broker's
+`mt5.py account --write`), else `budget`. It writes one FX order to
+`trader/orders.json` (`"market": "fx"`, `"venue": "mt5"`, `volume`, `sl`, `tp`).
+Nothing is placed: the user types it into MT5 after trader-risk and their yes.
+USD-quoted pairs only (EURUSD, GBPUSD, AUDUSD), so a pip is worth dollars.
+
 ## What it never does
 
 It never places, approves or schedules an order, never raises a limit on its

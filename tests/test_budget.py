@@ -26,6 +26,11 @@ CONTRACT_CFG = {
     "fractional": False, "broker": "alpaca", "paper": True, "blocked": [],
     "allow_options": False, "allow_margin": False, "allow_short": False, "pdt_guard": False,
     "sec_user_agent": "Your Name you@example.com",
+    # forex on MT5: off until the user turns it on
+    "allow_fx": False,
+    "fx": {"pairs": ["EURUSD"], "or_start": "08:00", "or_tz": "London", "or_minutes": 15,
+           "no_entries_after": "15:30", "flat_by": "16:30", "times_tz": "New York", "max_lots": 1.0,
+           "max_leverage_used": 10, "min_stop_spreads": 3, "min_stop_pips": 3},
 }
 # v1's rules, for the weights mode tests
 V1 = {"budget": 5000, "cash_buffer_pct": 10, "max_position_pct": 25, "max_order_usd": 2000, "min_order_usd": 5,

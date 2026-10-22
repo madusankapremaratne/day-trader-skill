@@ -156,6 +156,26 @@ it is after the 3:30 entry cutoff: it is an exit.
 - Free Yahoo prices are unofficial and can lag; the broker's price is the one that fills, and a
   stop can fill worse than its price in a fast market.
 
+## Forex (EURUSD) on MT5
+
+FX orders are blocked unless `"allow_fx": true` in `trader/config.json` (it
+is false in the example) and the pair is in `fx.pairs`. On top of the daily
+loss, trades a day, duplicate and daily order rules, an FX entry needs:
+
+- `"venue": "mt5"`, a market or limit order, a buy (still longs only)
+- a volume that is a whole number of lot steps, at least the minimum, at most
+  `fx.max_lots`
+- a stop loss under the entry and a take profit over it; the loss at the stop
+  (lots x 100,000 x distance) within `max_loss_per_trade_usd`; reward:risk at
+  least `min_reward_risk`
+- exposure (lots x 100,000 x price) within `fx.max_leverage_used` times the
+  balance in `trader/mt5/account.json`
+- the FX window: after the opening range is set (08:15 London by default),
+  no later than `fx.no_entries_after` (15:30 New York), never at the weekend
+
+A close of an open FX position (`"close": true`, from `ticket.py flatten`) is
+never blocked by the day limits or the window.
+
 ## What it never does
 
 It never places an order, never edits an order to make it pass, never

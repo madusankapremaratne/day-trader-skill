@@ -127,6 +127,26 @@ and the trigger moves to 10:35 AM at 365.75 (the 10:30 bar, 7.98x).
   reset it.
 - Never call an entry early because a bar looks like it will close above.
 
+## Forex (EURUSD) on MT5
+
+For a pair listed in `fx.pairs` in `trader/config.json` (EURUSD by default),
+the entry works on MT5 bars instead of Yahoo's, on the FX day instead of the
+NYSE session:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/../trader-broker/mt5.py" export EURUSD   # bars -> trader/mt5/EURUSD.json
+python3 "${CLAUDE_SKILL_DIR}/entry.py" check EURUSD --feed trader/mt5 --write
+python3 "${CLAUDE_SKILL_DIR}/entry.py" watch EURUSD --feed trader/mt5 --until 11:00   # with mt5.py follow running
+```
+
+- The opening range starts at `fx.or_start` in `fx.or_tz` (08:00 London by
+  default, which is 03:00 New York, or 04:00 in the weeks when London and New
+  York change clocks on different dates) and lasts `fx.or_minutes` (15).
+- No entries after `fx.no_entries_after` (15:30 New York). Closed at the
+  weekend. No NYSE holidays.
+- Prices keep the pair's 5 decimals (1.12228, not $1.12) and distances are in pips.
+- `--feed` reads the file on the real clock; `--offline` still replays a saved day.
+
 ## What it never does
 
 It never places an order, never sizes a position, never sets the stop (that

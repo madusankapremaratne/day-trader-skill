@@ -137,6 +137,37 @@ submits orders directly to the market. So with IBKR the final yes happens in
 IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
 that draft orders to Needs approval too.
 
+## Setup C: MetaTrader 5 (forex, you place the orders)
+
+For EURUSD and other USD-quoted pairs. `mt5.py` READS MetaTrader 5 through
+MetaQuotes' official Python package; it never sends, checks or changes an
+order, and no tool in this pack does. The user places every FX order by hand.
+
+1. The user installs MT5 from their broker and logs in (a demo account first).
+   Claude never asks for, types or stores the login or the password.
+2. `pip install MetaTrader5` (Windows only). Leave "Algo Trading" off in MT5.
+3. In `trader/config.json`: `"allow_fx": true` and the `"fx"` block from
+   `config.example.json`.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/mt5.py" account --write          # balance, leverage, demo or real
+python3 "${CLAUDE_SKILL_DIR}/mt5.py" export EURUSD --days 60  # bars + spec -> trader/mt5/EURUSD.json
+python3 "${CLAUDE_SKILL_DIR}/mt5.py" follow EURUSD --every 30 # keep it fresh while you watch an entry
+python3 "${CLAUDE_SKILL_DIR}/mt5.py" quote EURUSD --write     # bid / ask -> trader/prices.json
+python3 "${CLAUDE_SKILL_DIR}/mt5.py" positions                # confirm what you placed
+```
+
+MT5 stamps bars in the broker's server time (Pepperstone: UTC+2 or +3);
+`mt5.py` measures the offset from the latest tick and writes true UTC.
+
+An FX ticket (`"market": "fx"`) is not a tool call. `ticket.py show` prints
+what to type into MT5 (New Order, symbol, volume, stop loss, take profit),
+`approve` records the user's yes word for word as for stocks, the user places
+it themselves, then `ticket.py result --index N --status placed --broker-id
+<MT5 ticket> --filled-qty <lots> --filled-price <price>` logs it so trader-risk
+counts the day's loss. `ticket.py flatten --symbol EURUSD --qty <lots>` writes
+a close ticket for the flat-by time.
+
 ## Steps: the entry
 
 1. `ticket.py show`. Only READY tickets go to the user. A ticket that is NOT
@@ -201,6 +232,7 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
 - Never promises a fill price: a market order and a stop fill at whatever the market gives.
+- Never sends an FX order to MT5: no tool calls MT5's order functions. The user places FX orders by hand.
 
 ## Safety
 

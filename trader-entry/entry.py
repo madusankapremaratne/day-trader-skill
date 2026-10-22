@@ -143,6 +143,81 @@ def utc_now():
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
 
 
+# ---------------------------------------------------------------- forex (FX) mode
+
+FX_DEFAULTS = {"pairs": ["EURUSD"], "or_start": "08:00", "or_tz": "London", "or_minutes": 15,
+               "no_entries_after": "15:30", "flat_by": "16:30", "times_tz": "New York"}
+FX_PAIR = re.compile(r"^[A-Z]{3}USD$")   # v1: USD-quoted pairs, so a pip is worth dollars
+
+
+def _last_sunday(year, month):
+    d = datetime.date(year + (month == 12), month % 12 + 1, 1) - datetime.timedelta(days=1)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def london_offset(utc):
+    """Hours from UTC for London: +1 in summer time (1:00 UTC on the last Sunday
+    of March to 1:00 UTC on the last Sunday of October), 0 otherwise."""
+    y = utc.year
+    start = datetime.datetime.combine(_last_sunday(y, 3), datetime.time(1, 0))
+    end = datetime.datetime.combine(_last_sunday(y, 10), datetime.time(1, 0))
+    return 1 if start <= utc.replace(tzinfo=None) < end else 0
+
+
+def wall_to_utc(day, t, tz):
+    """A wall-clock time on `day` in London, New York or UTC -> naive UTC."""
+    local = datetime.datetime.combine(day, t)
+    z = str(tz).strip().lower()
+    if z in ("new york", "ny", "et", "america/new_york"):
+        return eastern_to_utc(local)
+    if z in ("london", "uk", "europe/london"):
+        for off in (1, 0):
+            utc = local - datetime.timedelta(hours=off)
+            if london_offset(utc) == off:
+                return utc
+        return local
+    if z in ("utc", "gmt", "z"):
+        return local
+    raise EntryError('fx times want "London", "New York" or "UTC", not %r' % tz)
+
+
+def fx_profile(cfg, sym):
+    """The FX settings when `sym` is one of the config's fx.pairs, else None."""
+    fx = dict(FX_DEFAULTS)
+    fx.update((cfg or {}).get("fx") or {})
+    pairs = [str(p).upper() for p in fx.get("pairs") or []]
+    if str(sym).upper() not in pairs:
+        return None
+    if not FX_PAIR.match(str(sym).upper()):
+        raise EntryError("%s: FX mode covers USD-quoted pairs only (EURUSD, GBPUSD, AUDUSD...)" % sym)
+    return fx
+
+
+def fx_session(day, fx):
+    """(open, close, cutoff) as New York wall-clock datetimes for FX day `day`,
+    or None at the weekend. Open = the opening-range start (London 08:00 by
+    default), close = flat_by (16:30 New York by default)."""
+    if day.weekday() >= 5:
+        return None
+    o = to_eastern(wall_to_utc(day, parse_hhmm(fx["or_start"], "fx.or_start"), fx["or_tz"]))
+    c = to_eastern(wall_to_utc(day, parse_hhmm(fx["flat_by"], "fx.flat_by"), fx["times_tz"]))
+    cut = to_eastern(wall_to_utc(day, parse_hhmm(fx["no_entries_after"], "fx.no_entries_after"), fx["times_tz"]))
+    if not o < cut <= c:
+        raise EntryError("fx times are out of order: range start %s, last entry %s, flat by %s (New York)"
+                         % (hm(o), hm(cut), hm(c)))
+    return o, c, cut
+
+
+def rd(x, digits=2):
+    return None if x is None else round(float(x), digits) + 0.0
+
+
+def px(x, res=None):
+    """$364.18 for a stock, 1.12036 for a pair (no dollar sign, the pair's digits)."""
+    d = (res or {}).get("digits", 2)
+    return "%s%.*f" % ((res or {}).get("cur", "$"), d, x)
+
+
 def utc_of(ts):
     """Unix seconds -> naive UTC, without the machine's time zone."""
     return EPOCH + datetime.timedelta(seconds=int(ts))
@@ -406,9 +481,22 @@ def early_cutoff(day, t, close_dt):
 
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
-    """Pure function: the setup's status at now_utc from one session's bars."""
+             min_volume_x=None, cfg=None, fx=None):
+    """Pure function: the setup's status at now_utc from one session's bars.
+    With fx (an FX profile) the session is the FX day and prices keep the pair's digits."""
     cfg = cfg or dict(DEFAULTS)
+    if fx and not or_minutes:
+        or_minutes = int(fx["or_minutes"])
+    or_minutes = or_minutes or 15
+    spec = (chart.get("meta") or {}).get("mt5") or {}
+    digits = int(spec.get("digits") or 5) if fx else 2
+    view = {"digits": digits, "cur": "" if fx else "$"}
+
+    def r2(x):   # prices, at the instrument's precision
+        return rd(x, digits)
+
+    def money(x):
+        return px(x, view)
     if interval not in INTERVALS:
         raise EntryError("--interval is 5m or 1m")
     step = INTERVALS[interval]
@@ -425,22 +513,38 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
            "last": None, "forming": None, "min_volume_x": min_volume_x,
-           "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": []}
+           "prev_close": chart.get("prev_close"), "calendar_known": bool(fx) or day.year in CALENDAR_YEARS,
+           "_bars": [], "market": "fx" if fx else "stock", "digits": digits, "cur": view["cur"],
+           "source": (chart.get("meta") or {}).get("source") or "yahoo"}
+    if fx:
+        res["spec"] = spec
     dt = chart.get("data_time")
     res["data_time"] = to_eastern(utc_of(dt)).strftime("%Y-%m-%d %H:%M:%S") if dt else None
-    ok, why = trading_day(day)
-    if not ok:
-        res.update(status="no-data", phase="closed", reason="the NYSE is closed today (%s)" % why,
-                   next_open=next_open(day))
-        return res
-    o, c = session(day)
-    open_dt = datetime.datetime.combine(day, o)
-    close_dt = datetime.datetime.combine(day, c)
-    early = c != CLOSE
-    before = datetime.datetime.combine(day, parse_hhmm(cfg["no_entries_before"], "no_entries_before"))
-    cutoff = early_cutoff(day, parse_hhmm(cfg["no_entries_after"], "no_entries_after"), close_dt)
-    or_end = open_dt + datetime.timedelta(minutes=or_minutes)
-    res.update(opens=hm(o), closes=hm(c), early_close=NYSE_EARLY_CLOSE.get(day.isoformat()),
+    if fx:
+        s = fx_session(day, fx)
+        if not s:
+            res.update(status="no-data", phase="closed", reason="the FX market is shut at the weekend")
+            return res
+        open_dt, close_dt, cutoff = s
+        early = False
+        or_end = open_dt + datetime.timedelta(minutes=or_minutes)
+        before = or_end
+        res["fx_open"] = "%s %s" % (fx["or_start"], fx["or_tz"])
+    else:
+        ok, why = trading_day(day)
+        if not ok:
+            res.update(status="no-data", phase="closed", reason="the NYSE is closed today (%s)" % why,
+                       next_open=next_open(day))
+            return res
+        o, c = session(day)
+        open_dt = datetime.datetime.combine(day, o)
+        close_dt = datetime.datetime.combine(day, c)
+        early = c != CLOSE
+        before = datetime.datetime.combine(day, parse_hhmm(cfg["no_entries_before"], "no_entries_before"))
+        cutoff = early_cutoff(day, parse_hhmm(cfg["no_entries_after"], "no_entries_after"), close_dt)
+        or_end = open_dt + datetime.timedelta(minutes=or_minutes)
+    res.update(opens=hm(open_dt), closes=hm(close_dt),
+               early_close=None if fx else NYSE_EARLY_CLOSE.get(day.isoformat()),
                no_entries_before=hm(before), no_entries_after=hm(cutoff))
 
     by_slot = {}
@@ -475,7 +579,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["bars_closed"] = len(bars)
 
     if local < open_dt:
-        res.update(phase="pre-open", reason="the NYSE opens at 9:30%s" % (
+        opener = ("the range starts at %s (%s New York)" % (res["fx_open"], short(open_dt)) if fx
+                  else "the NYSE opens at 9:30")
+        res.update(phase="pre-open", reason="%s%s" % (opener,
             " and the %d-minute range is set at %s" % (or_minutes, short(or_end)) if setup == "orb" else ""))
         return res
 
@@ -530,7 +636,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     if not bars:
         res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
         return res
-    what = "close above the range high $%.2f" % lvl if setup == "orb" else "close above $%.2f" % lvl
+    what = "close above the range high %s" % money(lvl) if setup == "orb" else "close above %s" % money(lvl)
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
         res.update(status="expired", phase="after-close" if local >= close_dt else "after-cutoff",
                    reason="no %s by %s, the last time for a new entry%s" % (
@@ -538,16 +644,18 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         return res
     res["phase"] = "open"
     if last["c"] > lvl and last in thin:
-        res["reason"] = "the %s bar closed above at $%.2f but on %.2fx the range's volume, under your %.2fx" % (
-            short(last["et"]), last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x)
+        res["reason"] = "the %s bar closed above at %s but on %.2fx the range's volume, under your %.2fx" % (
+            short(last["et"]), money(last["c"]), last["v"] / avg_vol if avg_vol else 0, min_volume_x)
     elif last["c"] > lvl and last["end"] < before:
-        res["reason"] = "the %s bar closed above at $%.2f, but no entries before %s (config)" % (
-            short(last["et"]), last["c"], short(before))
+        res["reason"] = "the %s bar closed above at %s, but no entries before %s (config)" % (
+            short(last["et"]), money(last["c"]), short(before))
     else:
         gap = lvl - last["c"]
-        res["reason"] = "last close $%.2f (%s bar), $%.2f %s %s (%+.2f%%)" % (
-            last["c"], short(last["et"]), abs(gap), "under" if gap >= 0 else "over",
-            "the range high $%.2f" % lvl if setup == "orb" else "the level $%.2f" % lvl,
+        res["reason"] = "last close %s (%s bar), %s %s %s (%+.2f%%)" % (
+            money(last["c"]), short(last["et"]),
+            ("%.1f pips" % (abs(gap) / spec["pip"])) if fx and spec.get("pip") else money(abs(gap)),
+            "under" if gap >= 0 else "over",
+            "the range high %s" % money(lvl) if setup == "orb" else "the level %s" % money(lvl),
             100.0 * (last["c"] / lvl - 1))
     return res
 
@@ -561,12 +669,17 @@ def entry_doc(res, now_utc):
     """trader/entry.json, the contract shape (plus a plain-words reason)."""
     t = res.get("trigger") or {}
     orr = res.get("opening_range")
-    return {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
+    doc = {"created_by": "trader-entry", "symbol": res["symbol"], "setup": res["setup"], "side": "buy",
             "date": res["date"], "status": res["status"], "time": t.get("time"), "bar_start": t.get("bar_start"),
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": res.get("source") or "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+    if res.get("market") == "fx":
+        doc.update(market="fx", spec=res.get("spec"), session={"opens": res.get("opens"), "closes": res.get("closes"),
+                                                             "no_entries_after": res.get("no_entries_after"),
+                                                             "range_start": res.get("fx_open"), "tz": "New York"})
+    return doc
 
 
 def write_json(path, doc):
@@ -588,15 +701,16 @@ SHORT = {"pre-open": "not open", "forming": "forming", "closed": "closed"}
 def setup_name(res):
     if res["setup"] == "orb":
         return "opening-range breakout (%d-minute range)" % res["or_minutes"]
-    return "close above $%.2f" % res["level"] if res["level"] is not None else "close above a level"
+    return "close above %s" % px(res["level"], res) if res["level"] is not None else "close above a level"
 
 
 def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s ET  %s on %s bars (Yahoo, free, can lag)" % (
-        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
+    feed = "MT5" if res.get("source") == "mt5" else "Yahoo, free, can lag"
+    head = "%s  %s %s ET  %s on %s bars (%s)" % (
+        res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars, feed)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
     out = [head]
@@ -604,21 +718,22 @@ def describe(res):
     if orr:
         start = datetime.datetime.strptime(res["opens"], "%H:%M")
         end = start + datetime.timedelta(minutes=orr["minutes"])
-        out.append("Opening range %s-%s: high $%.2f, low $%.2f (%d of %d bars%s)." % (
-            short(start), short(end), orr["high"], orr["low"], orr["bars"], orr["of"],
+        out.append("Opening range %s-%s%s: high %s, low %s (%d of %d bars%s)." % (
+            short(start), short(end), (" ET (the %s open)" % res["fx_open"]) if res.get("fx_open") else "",
+            px(orr["high"], res), px(orr["low"], res), orr["bars"], orr["of"],
             "" if orr["complete"] else ", still forming"))
     label = PHASE_LABEL.get(res["phase"]) or LABEL.get(res["status"], res["status"].upper())
     t = res.get("trigger")
     if t:
-        out.append("TRIGGERED %s at $%.2f: the %s bar (bar %d) closed above %s $%.2f (%+.2f%%%s)." % (
-            t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
-            "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
+        out.append("TRIGGERED %s at %s: the %s bar (bar %d) closed above %s %s (%+.2f%%%s)." % (
+            t["time"], px(t["price"], res), short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
+            "the range high" if res["setup"] == "orb" else "the level", px(res["level"], res), t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
-            out.append("That was %d minutes ago; the last close is $%.2f (%s bar). A late entry is a different "
+            out.append("That was %d minutes ago; the last close is %s (%s bar). A late entry is a different "
                        "trade: the price, the stop distance and the odds have moved." % (
-                           res["minutes_since"], res["last"]["close"], res["last"]["bar_start"]))
+                           res["minutes_since"], px(res["last"]["close"], res), res["last"]["bar_start"]))
         if res.get("data_note"):
             out.append(res["data_note"] + ".")
         if res.get("minutes_since", 0) > step:
@@ -633,8 +748,8 @@ def describe(res):
         if res.get("lag_note") and res["status"] == "waiting":
             out.append(res["lag_note"] + ".")
         elif f and res["status"] == "waiting" and res["phase"] in ("open", "forming"):
-            out.append("The %s bar is still forming ($%.2f so far, closes %s); it does not count until it closes." % (
-                f["bar_start"].lstrip("0"), f["price"], f["closes"]))
+            out.append("The %s bar is still forming (%s so far, closes %s); it does not count until it closes." % (
+                f["bar_start"].lstrip("0"), px(f["price"], res), f["closes"]))
         if res["status"] == "expired":
             out.append("No entry on this setup today. Nothing was placed.")
         if res.get("next_open"):
@@ -656,16 +771,16 @@ def bar_line(b, res):
     n_or = orr.get("of") or 0
     if res["setup"] == "orb" and b["slot"] < n_or:
         seen = [x for x in res["_bars"] if x["slot"] <= b["slot"]]
-        note = "range so far $%.2f to $%.2f" % (min(x["l"] for x in seen), max(x["h"] for x in seen))
+        note = "range so far %s to %s" % (px(min(x["l"] for x in seen), res), px(max(x["h"] for x in seen), res))
         if b["slot"] == n_or - 1:
-            note = "opening range set: high $%.2f, low $%.2f" % (orr["high"], orr["low"])
+            note = "opening range set: high %s, low %s" % (px(orr["high"], res), px(orr["low"], res))
     elif t and t["bar_index"] == b["slot"]:
-        note = "TRIGGERED: closed above $%.2f (%+.2f%%). Get in now if you take it: %s, $%.2f" % (
-            lvl, t["pct_over"], t["time"], t["price"])
+        note = "TRIGGERED: closed above %s (%+.2f%%). Get in now if you take it: %s, %s" % (
+            px(lvl, res), t["pct_over"], t["time"], px(t["price"], res))
     elif lvl is None:
         note = ""
     elif b["c"] > lvl:
-        note = "above $%.2f" % lvl
+        note = "above %s" % px(lvl, res)
         if res["setup"] == "level" or b["slot"] >= n_or:
             avg = orr.get("avg_volume")
             if res.get("min_volume_x") and avg:
@@ -673,8 +788,8 @@ def bar_line(b, res):
             elif b["end"] < datetime.datetime.combine(b["et"].date(), parse_hhmm(res["no_entries_before"], "x")):
                 note += ", but no entries before %s" % res["no_entries_before"]
     else:
-        note = "$%.2f under $%.2f" % (lvl - b["c"], lvl)
-    return "%5s bar  closed $%.2f  %s" % (start, b["c"], note)
+        note = "%s under %s" % (px(lvl - b["c"], res), px(lvl, res))
+    return "%5s bar  closed %s  %s" % (start, px(b["c"], res), note)
 
 
 # ---------------------------------------------------------------- watch
@@ -707,12 +822,19 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
             continue
         local = to_eastern(now)
         day = local.date()
-        s = session(day)
-        if not s:
-            emit("%s: market closed today (%s). Nothing to watch." % (day.isoformat(), trading_day(day)[1]))
-            return 1, None
-        open_dt = datetime.datetime.combine(day, s[0])
-        close_dt = datetime.datetime.combine(day, s[1])
+        if opts.get("fx"):
+            s = fx_session(day, opts["fx"])
+            if not s:
+                emit("%s: the FX market is shut at the weekend. Nothing to watch." % day.isoformat())
+                return 1, None
+            open_dt, close_dt = s[0], s[1]
+        else:
+            s = session(day)
+            if not s:
+                emit("%s: market closed today (%s). Nothing to watch." % (day.isoformat(), trading_day(day)[1]))
+                return 1, None
+            open_dt = datetime.datetime.combine(day, s[0])
+            close_dt = datetime.datetime.combine(day, s[1])
         if local < open_dt + datetime.timedelta(seconds=step):
             if not said_preopen:
                 emit("%s ET  %s: watching from the first bar's close at %s." % (
@@ -781,7 +903,7 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
 
 # ---------------------------------------------------------------- commands
 
-def _opts(a, cfg):
+def _opts(a, cfg, sym=None):
     if a.side in ("sell", "short"):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
     if a.setup == "orb" and a.level is not None:
@@ -790,13 +912,16 @@ def _opts(a, cfg):
         raise EntryError("--min-volume-x must be above 0")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
-    return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+    fx = fx_profile(cfg, sym) if sym else None
+    return {"setup": a.setup, "or_minutes": a.or_minutes or (None if fx else 15), "interval": a.interval,
+            "level": a.level, "min_volume_x": a.min_volume_x, "cfg": cfg, "fx": fx}
 
 
 def _load(a, sym, now):
     """(chart, now). An offline file without --now is read as of its own time."""
     real_today = to_eastern(utc_now()).date()
+    if getattr(a, "feed", None):
+        return get_chart(sym, a.interval, offline=a.feed), now or utc_now()
     if a.offline and now is None:
         ch = get_chart(sym, a.interval, offline=a.offline)
         return ch, (utc_of(ch["data_time"]) if ch.get("data_time") else utc_now())
@@ -806,8 +931,8 @@ def _load(a, sym, now):
 
 def cmd_check(a):
     cfg = read_config(a.config)
-    opts = _opts(a, cfg)
     sym = a.symbol.upper()
+    opts = _opts(a, cfg, sym)
     chart, now = _load(a, sym, parse_now(a.now) if a.now else None)
     res = evaluate(chart, now, **opts)
     if a.write:
@@ -824,8 +949,8 @@ def cmd_check(a):
 
 def cmd_watch(a):
     cfg = read_config(a.config)
-    opts = _opts(a, cfg)
     sym = a.symbol.upper()
+    opts = _opts(a, cfg, sym)
     if a.every <= 0:
         raise EntryError("--every must be above 0 seconds")
     start = parse_now(a.now) if a.now else None
@@ -839,6 +964,8 @@ def cmd_watch(a):
     real_today = to_eastern(utc_now()).date()
 
     def provider(now):
+        if a.feed:   # trader-broker's mt5.py follow keeps this file fresh
+            return get_chart(sym, a.interval, offline=a.feed)
         return get_chart(sym, a.interval, to_eastern(now).date(), a.offline, real_today)
 
     until = None
@@ -878,6 +1005,11 @@ def cmd_watchlist(a):
     for i, h in enumerate(hits):
         sym = str(h["symbol"]).upper()
         o = dict(opts)
+        try:
+            o.update(_opts(a, cfg, sym))
+        except EntryError as e:
+            rows.append((sym, None, str(e)))
+            continue
         if a.setup == "level" and o["level"] is None:
             o["level"] = h.get("level")
         try:
@@ -901,9 +1033,9 @@ def cmd_watchlist(a):
             last = r.get("last") or {}
             status = SHORT.get(r["phase"], r["status"]) if r["status"] != "triggered" else "triggered"
             print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % (
-                s, status[:9], t.get("time") or "-", ("$%.2f" % t["price"]) if t else "-",
-                ("$%.2f" % r["level"]) if r.get("level") is not None else "-",
-                ("$%.2f" % last["close"]) if last else "-",
+                s, status[:9], t.get("time") or "-", px(t["price"], r) if t else "-",
+                px(r["level"], r) if r.get("level") is not None else "-",
+                px(last["close"], r) if last else "-",
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
@@ -917,13 +1049,15 @@ def main(argv=None):
 
     def common(p):
         p.add_argument("--setup", choices=["orb", "level"], default="orb")
-        p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
+        p.add_argument("--or-minutes", type=int, help="opening range length (default 15, or fx.or_minutes)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
         p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
+        p.add_argument("--feed", metavar="PATH", help="a live chart file or folder on the real clock "
+                                                      "(trader/mt5, kept fresh by trader-broker's mt5.py)")
         p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("check", help="the setup's status right now")

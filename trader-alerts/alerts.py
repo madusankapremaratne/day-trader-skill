@@ -310,8 +310,46 @@ def _offline_text(folder, source, sym):
     raise AlertError("no offline quote file %s" % base)
 
 
-def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
+MT5_FRESH = 180   # seconds: an MT5 quote file older than this is not used for an alert
+
+
+def mt5_quotes(symbols, path, now_utc):
+    """Quotes from the prices.json that trader-broker's mt5.py quote --write keeps fresh.
+    A long's stop and target are hit at the bid, so the bid is the price."""
+    doc = _read(path, None)
+    quotes, errors = {}, []
+    if not doc or doc.get("source") != "mt5":
+        return {}, ["no MT5 quotes in %s: run trader-broker's mt5.py quote %s --write first"
+                    % (path, " ".join(symbols))]
+    for sym in symbols:
+        d = (doc.get("detail") or {}).get(sym) or {}
+        bid = d.get("bid")
+        if bid is None:
+            errors.append("no MT5 quote for %s in %s" % (sym, path))
+            continue
+        try:
+            when = datetime.datetime.strptime(str(d.get("time"))[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            when = None
+        if when is None or abs((now_utc - when).total_seconds()) > MT5_FRESH:
+            errors.append("the MT5 quote for %s in %s is from %s, over %d seconds old: run mt5.py quote again"
+                          % (sym, path, d.get("time"), MT5_FRESH))
+            continue
+        digits = len(str(bid).split(".")[1]) if "." in str(bid) else 0
+        quotes[sym] = {"symbol": sym, "price": float(bid), "ask": d.get("ask"), "prev_close": d.get("prev_close"),
+                       "open": None, "time": d.get("time"), "source": "mt5", "digits": max(digits, 5), "cur": ""}
+    return quotes, errors
+
+
+def pq(x, q):
+    """$364.18 for a stock quote, 1.12036 for an MT5 pair."""
+    return "%s%.*f" % ((q or {}).get("cur", "$"), (q or {}).get("digits", 2), x)
+
+
+def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE, mt5_path="trader/prices.json", now_utc=None):
     """{SYM: quote} and [errors]. One request per ticker, with a pause between."""
+    if source == "mt5":
+        return mt5_quotes([s.upper() for s in symbols], mt5_path, now_utc or parse_now(None))
     quotes, errors = {}, []
     for i, sym in enumerate(symbols):
         sym = sym.upper()
@@ -448,14 +486,22 @@ def evaluate(rules, quotes, status, state, now_utc):
             continue
         if typ == "time":
             at = ring_time(r, status)
-            if status.get("opens") and local.time() >= at and not _rang_today(rung.get(rid), today):
+            fx = r.get("market") == "fx"
+            day_on = (local.weekday() < 5) if fx else bool(status.get("opens"))
+            if day_on and local.time() >= at and not _rang_today(rung.get(rid), today):
                 label = r.get("label") or "time alert"
                 msg = "%s%s: it is %s New York (set for %s)" % (label[:1].upper(), label[1:],
                                                                  local.strftime("%H:%M"), at.strftime("%H:%M"))
-                msg += (", the market closes at %s." % status["closes"]) if status["open"] else \
-                    ", the market has closed."
+                if fx:
+                    msg += ", the FX day rolls over at 17:00 New York."
+                else:
+                    msg += (", the market closes at %s." % status["closes"]) if status["open"] else \
+                        ", the market has closed."
                 sym = str(r.get("symbol") or "").upper()
-                if sym:
+                if sym and fx:
+                    msg += (" If %s is still open, close it in MT5: trader-broker flatten --symbol %s --qty LOTS "
+                            "builds the ticket, then trader-risk and your yes." % (sym, sym))
+                elif sym:
                     msg += (" If %s is still open, close it: trader-broker flatten --symbol %s builds the sell "
                             "ticket, then trader-risk and your yes." % (sym, sym))
                 rings.append({"id": rid, "symbol": sym, "message": msg})
@@ -471,9 +517,10 @@ def evaluate(rules, quotes, status, state, now_utc):
             if hit and rid not in rung:
                 word = "at or above" if typ == "above" else "at or below"
                 label = {"stop": "stop", "target": "target"}.get(r["type"], "alert level")
-                rings.append({"id": rid, "symbol": sym, "message": "%s %s $%.2f: %s your %s $%s%s."
-                              % (sym, "is" if status["open"] else "last", p, word, label, _n(r["price"]),
-                                 (" (" + r["note"] + ")") if r.get("note") else "")})
+                live = status["open"] or q.get("source") == "mt5"
+                rings.append({"id": rid, "symbol": sym, "message": "%s %s %s: %s your %s %s%s%s."
+                              % (sym, "is" if live else "last", pq(p, q), word, label, q.get("cur", "$"),
+                                 _n(r["price"], q.get("digits", 2)), (" (" + r["note"] + ")") if r.get("note") else "")})
                 rung[rid] = stamp
             elif not hit and rid in rung and r.get("rearm"):
                 del rung[rid]
@@ -485,16 +532,16 @@ def evaluate(rules, quotes, status, state, now_utc):
             want = r.get("direction")
             hit = abs(move) >= r["pct"] and (not want or (want == "up") == (move > 0))
             if hit and not _rang_today(rung.get(rid), today):
-                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to $%.2f (from $%.2f)."
-                              % (sym, move, p, float(ref))})
+                rings.append({"id": rid, "symbol": sym, "message": "%s moved %+.2f%% to %s (from %s)."
+                              % (sym, move, pq(p, q), pq(float(ref), q))})
                 rung[rid] = stamp
     state["last_check"] = stamp
     return rings, state
 
 
-def _n(x):
+def _n(x, digits=2):
     x = float(x)
-    return str(int(x)) if x == int(x) else "%.2f" % x
+    return str(int(x)) if x == int(x) else "%.*f" % (digits, x)
 
 
 def rules_from_plan(plan, cfg_flat_by=None):
@@ -518,6 +565,9 @@ def rules_from_plan(plan, cfg_flat_by=None):
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])
+    if plan.get("market") == "fx":
+        for r in out:
+            r["market"] = "fx"
     return out
 
 
@@ -563,6 +613,8 @@ def cmd_quote(a):
     syms = _dedupe([s.upper() for s in a.symbols] + (holdings(a) if a.holdings else []))
     if not syms:
         raise AlertError("which tickers? alerts.py quote TSLA KO, or --holdings")
+    if a.source == "mt5":
+        raise AlertError("MT5 quotes come from trader-broker: mt5.py quote %s --write" % " ".join(syms))
     now = parse_now(a.now)
     quotes, errors = get_quotes(syms, a.source, a.offline)
     if a.write and quotes:
@@ -594,12 +646,13 @@ def cmd_check(a):
     status = market_status(now)
     watched = [r for r in rules if active(r, status["date"])]
     syms = _dedupe([str(r.get("symbol", "")).upper() for r in watched if r.get("type") not in NO_QUOTE])
-    quotes, errors = (get_quotes(syms, a.source, a.offline) if syms else ({}, []))
+    quotes, errors = (get_quotes(syms, a.source, a.offline, mt5_path=a.prices_out, now_utc=now)
+                      if syms else ({}, []))
     state = _read(a.state, {})
     rings, state = evaluate(rules, quotes, status, state, now)
     if not a.no_write:
         _write(a.state, state)
-        if quotes:
+        if quotes and a.source != "mt5":     # mt5.py quote writes that file itself
             write_prices(a.prices_out, quotes, now, a.source)
     if a.json:
         print(json.dumps({"market": status, "rings": rings, "errors": errors,
@@ -611,7 +664,8 @@ def cmd_check(a):
             print("ALERT " + r["message"])
         if not rings:
             print("Nothing hit. %d rule(s) watched today%s." % (
-                len(watched), (", " + ", ".join("%s $%.2f" % (s, quotes[s]["price"]) for s in syms if s in quotes))
+                len(watched), (", " + ", ".join("%s %s" % (s, pq(quotes[s]["price"], quotes[s]))
+                                                for s in syms if s in quotes))
                 if quotes else ""))
         for e in errors:
             print("error: " + e)
@@ -720,7 +774,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
-        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq"])
+        p.add_argument("--source", default="yahoo", choices=["yahoo", "stooq", "mt5"],
+                       help="mt5 reads trader/prices.json from trader-broker's mt5.py quote --write")
         p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
         p.add_argument("--now", help="pretend it is this time (no offset = New York time)")
         p.add_argument("--json", action="store_true")

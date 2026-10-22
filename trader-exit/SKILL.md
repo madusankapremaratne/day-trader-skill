@@ -117,6 +117,21 @@ sizes it: a $50 max loss per trade buys floor(50 / 5.86) = 8 shares.
   prediction that the price gets there.
 - Long side only. v2 plans longs only.
 
+## Forex (EURUSD) on MT5
+
+An FX entry from `/trader-entry` (or `--symbol EURUSD` with the pair in
+`fx.pairs`) gets an FX plan:
+
+- Stops round down to the pair's point (0.00001), not the cent. Risk shows in
+  pips and in dollars for one standard lot (EURUSD: $10 a pip).
+- A stop closer than `fx.min_stop_pips` (3) or `fx.min_stop_spreads` (3) times
+  the MT5 spread is refused as too tight.
+- Flat by `fx.flat_by` (16:30 New York), before the 17:00 rollover, so there is
+  no overnight swap.
+- `--feed trader/mt5` reads the pair's spec (digits, spread) and the bars for an
+  `atr:K` stop. The plan carries `"market": "fx"`, the spec and the session, so
+  the Time Machine and the Budget Manager do not have to work them out again.
+
 ## What it never does
 
 It never places an order, never sizes a position, never widens a stop to

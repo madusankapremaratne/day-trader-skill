@@ -145,6 +145,19 @@ watched; with `add --opening-bell`, the bell rings at 9:30.
 - Never present a quote as live. Free quotes are delayed and unofficial.
 - Confirm every new rule back to the user: ticker, type, level, day.
 
+## Forex (EURUSD) on MT5
+
+Alerts from an FX plan watch MT5's bid, at the pair's 5 decimals, and the
+flat-by alert rings at 16:30 New York on any weekday:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/../trader-broker/mt5.py" quote EURUSD --write
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" check --source mt5
+```
+
+`--source mt5` reads `trader/prices.json` and refuses a quote older than
+three minutes, so run the two together (a scheduled task or `/loop`).
+
 ## What it never does
 
 It never places, cancels or changes an order, never claims a quote is

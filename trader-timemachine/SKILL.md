@@ -151,6 +151,20 @@ the user should hear before `/trader-budget` sizes 8 shares.
 - Always say the seed, so any run can be repeated.
 - One plan per run. A changed entry, stop, target or date is a new run.
 
+## Forex (EURUSD) on MT5
+
+An FX plan from `/trader-exit` replays on MT5's bars:
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --feed trader/mt5
+```
+
+The session runs from the London open (the plan's `session.range_start`) to
+the flat-by time (16:30 New York): 162 five-minute bars, 150 in the weeks when
+London and New York change clocks on different dates. Past days that do not
+have every bar up to the replay's end are left out and listed. Prices keep the
+pair's 5 decimals.
+
 ## What it never does
 
 It never places an order, never sizes a position, never changes the plan,

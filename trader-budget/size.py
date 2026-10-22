@@ -485,6 +485,197 @@ def plan_report(s, order, notes=()):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------- FX mode (a pair from trader-exit, in lots)
+
+FX_DEFAULTS = {"max_lots": 1.0, "max_leverage_used": 10, "leverage": 30}
+FX_SPEC = {"digits": 5, "point": 0.00001, "pip": 0.0001, "contract_size": 100000.0, "volume_min": 0.01,
+           "volume_step": 0.01, "volume_max": 100.0}
+
+
+def lots_for(usd, per_lot, step):
+    """Whole lot steps that fit in usd at per_lot dollars a lot."""
+    if per_lot <= 0 or usd <= 0:
+        return 0.0
+    n = int(math.floor(float(usd) / (per_lot * step) + EPS))
+    return round(n * step, 8)
+
+
+def lot_str(x):
+    """0.62 -> "0.62", 1.0 -> "1.00": MT5's volume box shows two decimals."""
+    return "%.2f" % x
+
+
+def size_fx(plan, cfg, account=None, price=None, limit=None, today=None):
+    """Pure function: one FX plan + your rules -> the sizing in lots (qty may be 0).
+
+    account  trader/mt5/account.json (balance, leverage), if there is one
+    price    a FRESH ask from trader/prices.json; a market buy is sized at the higher of it and the entry"""
+    c = dict(DEFAULTS)
+    c.update(cfg or {})
+    fx = dict(FX_DEFAULTS)
+    fx.update(c.get("fx") or {})
+    spec = dict(FX_SPEC)
+    spec.update(plan.get("spec") or {})
+    sym = str(plan.get("symbol") or "").strip().upper()
+    if str(plan.get("side") or "buy").lower() != "buy":
+        raise SizeError("this pack sizes long (buy) trades only; the plan says %r" % plan.get("side"))
+    if sym not in [str(x).upper() for x in fx.get("pairs") or ["EURUSD"]]:
+        raise SizeError("%s is not in fx.pairs in trader/config.json" % sym)
+    if not (len(sym) == 6 and sym.endswith("USD")):
+        raise SizeError("%s: FX sizing covers USD-quoted pairs only (a pip has to be worth dollars)" % sym)
+    if today and plan.get("date") and str(plan["date"]) != today:
+        raise SizeError("the plan is for %s and today is %s in New York: make a new plan with trader-exit"
+                        % (plan["date"], today))
+    d = int(spec["digits"])
+    entry_plan, stop, target = _f(plan.get("entry")), _f(plan.get("stop")), _f(plan.get("target"))
+    for name, v in (("entry", entry_plan), ("stop", stop), ("target", target)):
+        if v is None or v <= 0:
+            raise SizeError("the plan needs a positive %s (run trader-exit)" % name)
+    if sym in {str(b).upper() for b in (c.get("blocked") or [])}:
+        raise SizeError("%s is on your blocked list" % sym)
+    if limit is not None:
+        ref, ref_from = round(limit, d), "limit"
+    elif price is not None and round(price, d) > round(entry_plan, d):
+        ref, ref_from = round(price, d), "price"
+    else:
+        ref, ref_from = round(entry_plan, d), "plan"
+    point, pip, contract = float(spec["point"]), float(spec["pip"]), float(spec["contract_size"])
+    risk_pts = int(round((ref - stop) / point))
+    reward_pts = int(round((target - ref) / point))
+    if risk_pts <= 0:
+        raise SizeError("the stop %.*f is not below the entry %.*f" % (d, stop, d, ref))
+    if reward_pts <= 0:
+        raise SizeError("the target %.*f is not above the entry %.*f: the move has already happened. "
+                        "Skip it or make a new plan with trader-exit" % (d, target, d, ref))
+    risk = risk_pts * point
+    per_lot = round(risk * contract, 2)            # dollars lost at the stop per 1.00 lot
+    pips = risk / pip
+
+    acct = account or {}
+    if _f(acct.get("balance")):
+        balance, bal_from = float(acct["balance"]), "MT5 %s balance" % (acct.get("mode") or "account")
+    else:
+        balance, bal_from = float(c.get("budget") or 0), "budget"
+    if balance <= 0:
+        raise SizeError("no balance: run trader-broker's mt5.py account --write, or set \"budget\"")
+    leverage = float(_f(acct.get("leverage")) or fx["leverage"])
+    buf = round(balance * float(c.get("cash_buffer_pct") or 0) / 100.0, 2)
+    free = max(balance - buf, 0.0)
+    notional_lot = contract * ref                  # dollars of exposure per 1.00 lot
+    margin_lot = notional_lot / leverage
+    step = float(spec["volume_step"])
+
+    limits = []
+    max_loss = _f(c.get("max_loss_per_trade_usd"))
+    if max_loss:
+        limits.append({"name": "max loss", "lots": lots_for(max_loss, per_lot, step),
+                       "how": "%s max loss / %s a lot at the stop (%.1f pips)" % (money(max_loss), money(per_lot), pips)})
+    max_lots = _f(fx.get("max_lots"))
+    if max_lots:
+        limits.append({"name": "max lots", "lots": round(math.floor(max_lots / step + EPS) * step, 8),
+                       "how": "fx.max_lots in the config"})
+    limits.append({"name": "margin", "lots": lots_for(free, margin_lot, step),
+                   "how": "%s %s minus the %s buffer / %s margin a lot (1:%d)"
+                          % (bal_from, money(balance), money(buf), money(round(margin_lot, 2)), leverage)})
+    lev_cap = _f(fx.get("max_leverage_used"))
+    if lev_cap:
+        limits.append({"name": "leverage", "lots": lots_for(balance * lev_cap, notional_lot, step),
+                       "how": "%gx your %s = %s exposure / %s a lot" % (lev_cap, money(balance),
+                                                                   money(balance * lev_cap), money(round(notional_lot)))})
+    vmax = float(spec.get("volume_max") or 0)
+    if vmax:
+        limits.append({"name": "broker max", "lots": vmax, "how": "the broker's largest order"})
+
+    lots = max(0.0, min(l["lots"] for l in limits))
+    bound = [l["name"] for l in limits if abs(l["lots"] - lots) < 1e-9]
+    for l in limits:
+        l["binds"] = l["name"] == bound[0]
+    refusal = None
+    vmin = float(spec["volume_min"])
+    if lots < vmin - 1e-9:
+        if bound[0] == "max loss":
+            refusal = ("the smallest order, %s lots, loses %s at the stop (%.1f pips), more than your %s max "
+                       "loss per trade. No order. Skip it, or plan a closer stop with trader-exit."
+                       % (lot_str(vmin), money(per_lot * vmin), pips, money(max_loss)))
+        else:
+            refusal = "%s allows under the %s-lot minimum. No order." % (bound[0], lot_str(vmin))
+        lots = 0.0
+    elif _f(c.get("min_reward_risk")) and reward_pts < _f(c["min_reward_risk"]) * risk_pts - EPS:
+        refusal = ("reward:risk %.2f is under your minimum %s, so trader-risk would block it. No order."
+                   % (reward_pts / float(risk_pts), _num(c["min_reward_risk"])))
+    loss = round(lots * per_lot, 2)
+    return {
+        "market": "fx", "symbol": sym, "side": "buy", "setup": plan.get("setup", ""), "date": plan.get("date"),
+        "entry_time": plan.get("entry_time", ""), "entry_plan": round(entry_plan, d), "entry": ref,
+        "entry_from": ref_from, "stop": round(stop, d), "target": round(target, d), "digits": d, "spec": spec,
+        "risk": round(risk, d), "risk_pips": round(pips, 1), "per_lot": per_lot,
+        "reward_risk": round(reward_pts / float(risk_pts), 2), "stop_label": plan.get("stop_label", ""),
+        "target_label": plan.get("target_label", ""), "balance": balance, "balance_from": bal_from,
+        "leverage": leverage, "cash_buffer": buf, "max_loss_per_trade_usd": max_loss, "limits": limits,
+        "lots": lots, "bound_by": bound[0], "max_loss": loss, "notional": round(lots * notional_lot, 2),
+        "margin": round(lots * margin_lot, 2), "flat_by": plan.get("flat_by") or "16:30",
+        "order_type": "limit" if limit is not None else "market", "refusal": refusal,
+    }
+
+
+def fx_order(s):
+    """The one proposed FX order: what you type into MT5's New Order window. Never sent by a tool."""
+    if s["refusal"] or s["lots"] <= 0:
+        return None
+    d = s["digits"]
+    o = {"market": "fx", "venue": "mt5", "symbol": s["symbol"], "side": "buy", "volume": lot_str(s["lots"]),
+         "type": s["order_type"], "sl": "%.*f" % (d, s["stop"]), "tp": "%.*f" % (d, s["target"])}
+    if s["order_type"] == "limit":
+        o["price"] = "%.*f" % (d, s["entry"])
+    o["why"] = ("%s on %s: %s lots, bound by your %s (%s x %s a lot = %s at the stop, %.1f pips)"
+                % (SETUP_WORDS.get(s["setup"], s["setup"] or "day trade"), s["symbol"], lot_str(s["lots"]),
+                   s["bound_by"], lot_str(s["lots"]), money(s["per_lot"]), money(s["max_loss"]), s["risk_pips"]))
+    o["plan"] = {"entry": s["entry"], "stop": s["stop"], "target": s["target"], "risk": s["risk"],
+                 "risk_pips": s["risk_pips"], "per_lot": s["per_lot"], "max_loss": s["max_loss"],
+                 "notional": s["notional"], "setup": s["setup"], "entry_time": s["entry_time"],
+                 "flat_by": s["flat_by"], "spec": s["spec"]}
+    return o
+
+
+def fx_report(s, order, notes=()):
+    d = s["digits"]
+    f = lambda x: "%.*f" % (d, x)
+    setup = SETUP_WORDS.get(s["setup"], s["setup"] or "setup")
+    lines = ["%s buy, %s, entry %s%s" % (s["symbol"], setup, f(s["entry_plan"]),
+                                        (" at " + s["entry_time"] + " ET") if s["entry_time"] else ""),
+             "Stop %s%s. Target %s%s." % (f(s["stop"]), (": " + s["stop_label"]) if s["stop_label"] else "",
+                                         f(s["target"]), (": " + s["target_label"]) if s["target_label"] else "")]
+    lines += list(notes)
+    src = {"plan": "the plan's entry", "price": "the latest ask, above the plan's entry",
+           "limit": "your limit price"}[s["entry_from"]]
+    lines.append("Sized at %s (%s). Risk %.1f pips = %s a standard lot at the stop. Reward:risk %.2f."
+                 % (f(s["entry"]), src, s["risk_pips"], money(s["per_lot"]), s["reward_risk"]))
+    lines.append("")
+    lines.append("Limits (lots, step %s; the smallest one wins):" % s["spec"]["volume_step"])
+    for l in s["limits"]:
+        lines.append("  %-11s %-70s %7s lots%s" % (l["name"], l["how"], lot_str(l["lots"]),
+                                                   "  <- binds" if l["binds"] else ""))
+    lines.append("")
+    if order is None:
+        lines.append("No order: " + s["refusal"])
+        lines.append("Education and tooling, not financial advice.")
+        return "\n".join(lines)
+    lines.append("Size: %s lots of %s (%s of %s exposure, about %s margin). Max loss at the stop: %s lots x %s = %s."
+                 % (lot_str(s["lots"]), s["symbol"], money(s["notional"]), s["symbol"][:3], money(s["margin"]),
+                    lot_str(s["lots"]), money(s["per_lot"]), money(s["max_loss"])))
+    lines.append("A stop is an order, not a promise: on a news spike it can fill below %s." % f(s["stop"]))
+    lines.append("")
+    lines.append("Proposed order (you type it into MT5 yourself, nothing has been placed):")
+    lines.append("  BUY %s %s lots, %s, stop loss %s, take profit %s"
+                 % (s["symbol"], order["volume"], "limit %s" % order["price"] if order["type"] == "limit" else "market",
+                    order["sl"], order["tp"]))
+    lines.append("Flat by %s New York, before the 17:00 rollover: close whatever is still open then." % s["flat_by"])
+    lines.append("")
+    lines.append("Next: trader-risk checks it, then trader-broker shows the MT5 ticket and asks you yes or no.")
+    lines.append("Education and tooling, not financial advice.")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- weights mode (v1)
 
 def normalise(rows, blocked=(), top=None):
@@ -785,6 +976,8 @@ def run_plan(a, cfg):
             if limit is None or limit <= 0:
                 raise SizeError("--limit wants a price, like --limit 364.00")
     sym = str((plan or {}).get("symbol") or "").upper()
+    if isinstance(plan, dict) and plan.get("market") == "fx":
+        return run_fx(a, cfg, plan, limit, now, today)
     notes, price = [], None
     ppath = a.prices or ("trader/prices.json" if os.path.exists("trader/prices.json") else None)
     if ppath and limit is None and sym:
@@ -815,6 +1008,44 @@ def run_plan(a, cfg):
         print(plan_report(s, order, notes))
         if order and a.write:
             print("Wrote 1 proposed bracket order to %s" % a.write)
+    return 0 if order else 1
+
+
+def run_fx(a, cfg, plan, limit, now, today):
+    sym = str(plan.get("symbol") or "").upper()
+    d = int((plan.get("spec") or {}).get("digits") or 5)
+    notes, price = [], None
+    ppath = a.prices or ("trader/prices.json" if os.path.exists("trader/prices.json") else None)
+    if ppath and limit is None:
+        pdoc = read_json(ppath, "prices")
+        p, t, fresh = fresh_price(pdoc, sym, now)
+        ask = _f((((pdoc or {}).get("detail") or {}).get(sym) or {}).get("ask"))
+        p = ask or p      # a buy fills at the ask
+        if p is not None and fresh:
+            price = p
+            if round(p, d) > round(_f(plan.get("entry")) or 0, d):
+                notes.append("%s ask %.*f (as of %s New York) is above the plan's entry %.*f, so the risk is "
+                             "bigger: sized at %.*f." % (sym, d, p, to_eastern(t).strftime("%H:%M"), d,
+                                                         _f(plan.get("entry")), d, p))
+        elif p is not None:
+            notes.append("%s in %s is older than %d minutes: not used. Sized at the plan's entry."
+                         % (sym, ppath, FRESH_MINUTES))
+    account = None
+    if os.path.exists(a.account):
+        account = read_json(a.account, "MT5 account")
+        notes.append("Balance and leverage from %s (%s, as of %s)." % (
+            a.account, (account.get("mode") or "?").upper(), account.get("as_of") or "?"))
+    s = size_fx(plan, cfg, account, price, limit, today)
+    order = fx_order(s)
+    if order and a.write:
+        write_orders(a.write, [order], cfg, "trader/plan.json (%s %s %s)" % (sym, s["setup"] or "plan", s["date"]),
+                     now)
+    if a.json:
+        print(json.dumps({"sizing": s, "orders": [order] if order else [], "notes": notes}, indent=2))
+    else:
+        print(fx_report(s, order, notes))
+        if order and a.write:
+            print("Wrote 1 proposed FX order to %s" % a.write)
     return 0 if order else 1
 
 
@@ -854,6 +1085,8 @@ def main(argv=None):
     ap.add_argument("--prices", help="prices JSON (default trader/prices.json if it exists)")
     ap.add_argument("--portfolio", default="trader/portfolio.json",
                     help="your account; its cash caps the size if it exists")
+    ap.add_argument("--account", default="trader/mt5/account.json",
+                    help="an FX plan's balance and leverage (trader-broker's mt5.py account --write)")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--write", nargs="?", const="trader/orders.json", metavar="PATH",
                     help="write the proposed order (default trader/orders.json)")

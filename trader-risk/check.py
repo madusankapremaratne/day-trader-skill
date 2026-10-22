@@ -268,9 +268,12 @@ def read_json(path, what, required=True):
         raise RiskError("%s is not valid JSON: %s" % (path, e))
 
 
+FX_FIELDS = ("market", "venue", "volume", "price", "sl", "tp", "close")
+
+
 def fingerprint(order):
     """Same function in trader-broker/ticket.py: the exact order that was checked."""
-    core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    core = {k: order[k] for k in ALPACA_FIELDS + FX_FIELDS if k in order and order[k] is not None}
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -293,6 +296,180 @@ def _cent(x):
 
 def _p(x):
     return "%.2f" % float(x)
+
+
+# ---------------------------------------------------------------- forex (FX) orders, placed by hand in MT5
+
+FX_DEFAULTS = {"pairs": ["EURUSD"], "or_start": "08:00", "or_tz": "London", "or_minutes": 15,
+               "no_entries_after": "15:30", "flat_by": "16:30", "times_tz": "New York",
+               "max_lots": 1.0, "max_leverage_used": 10}
+FX_SPEC = {"digits": 5, "point": 0.00001, "pip": 0.0001, "contract_size": 100000.0, "volume_min": 0.01,
+           "volume_step": 0.01, "volume_max": 100.0}
+FX_PAIR = re.compile(r"^[A-Z]{3}USD$")
+
+
+def _last_sunday(year, month):
+    d = datetime.date(year + (month == 12), month % 12 + 1, 1) - datetime.timedelta(days=1)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def london_offset(utc):
+    """+1 in UK summer time (1:00 UTC last Sunday of March to last Sunday of October), else 0."""
+    y = utc.year
+    start = datetime.datetime.combine(_last_sunday(y, 3), datetime.time(1, 0))
+    end = datetime.datetime.combine(_last_sunday(y, 10), datetime.time(1, 0))
+    return 1 if start <= utc.replace(tzinfo=None) < end else 0
+
+
+def wall_to_et(day, t, tz):
+    """A wall-clock time on `day` in London, New York or UTC -> New York wall-clock datetime."""
+    local = datetime.datetime.combine(day, t)
+    z = str(tz).strip().lower()
+    if z in ("new york", "ny", "et", "america/new_york"):
+        return local
+    if z in ("london", "uk", "europe/london"):
+        utc = local
+        for off in (1, 0):
+            if london_offset(local - datetime.timedelta(hours=off)) == off:
+                utc = local - datetime.timedelta(hours=off)
+                break
+    elif z in ("utc", "gmt", "z"):
+        utc = local
+    else:
+        raise RiskError('fx times want "London", "New York" or "UTC", not %r' % tz)
+    return to_eastern(utc)
+
+
+def fx_window(now_et, fx):
+    """Reasons a new FX entry cannot be placed now: the weekend, before the opening
+    range is set, or after fx.no_entries_after."""
+    d = now_et.date()
+    stamp = now_et.strftime("%a %Y-%m-%d %H:%M")
+    if d.weekday() >= 5:
+        return ["window: the FX market is shut at the weekend (%s New York)" % stamp]
+    start = wall_to_et(d, hhmm(fx["or_start"], "fx.or_start"), fx["or_tz"])
+    first = start + datetime.timedelta(minutes=int(fx.get("or_minutes") or 15))
+    last = wall_to_et(d, hhmm(fx["no_entries_after"], "fx.no_entries_after"), fx["times_tz"])
+    if now_et < first:
+        return ["window: no FX entries before the opening range is set, %s New York (the %s %s open + %d "
+                "minutes; it is %s)" % (first.strftime("%H:%M"), fx["or_start"], fx["or_tz"],
+                                        int(fx.get("or_minutes") or 15), now_et.strftime("%H:%M"))]
+    if now_et.replace(second=0, microsecond=0) > last:
+        return ["window: no new FX entries after %s New York (it is %s)" % (last.strftime("%H:%M"),
+                                                                            now_et.strftime("%H:%M"))]
+    return []
+
+
+def fx_check(o, c, fresh_price, fx_account=None):
+    """One FX order -> (reasons, later, warns, info, kind, numbers). `later` holds the
+    entry-only reasons (an exit, a close of an open position, is never blocked by them)."""
+    reasons, later, warns, info = [], [], [], []
+    fx = dict(FX_DEFAULTS)
+    fx.update(c.get("fx") or {})
+    plan = o.get("plan") if isinstance(o.get("plan"), dict) else {}
+    spec = dict(FX_SPEC)
+    spec.update(plan.get("spec") or {})
+    d = int(spec["digits"])
+    sym = str(o.get("symbol", "")).strip().upper()
+    side = str(o.get("side", "")).strip().lower()
+    typ = str(o.get("type", "market")).strip().lower()
+    kind = "exit" if o.get("close") else "entry"
+    nums = {"max_loss": None, "risk": None, "rr": None, "stop": None, "target": None, "ref": None,
+            "ref_from": None, "lots": None, "notional": None}
+    f = lambda x: "%.*f" % (d, x)
+
+    if not c.get("allow_fx"):
+        reasons.append("asset: %s is a currency pair; FX is off (\"allow_fx\": false in trader/config.json)" % sym)
+    if sym not in [str(x).upper() for x in fx.get("pairs") or []]:
+        reasons.append("asset: %s is not in fx.pairs in the config" % sym)
+    elif not FX_PAIR.match(sym):
+        reasons.append("asset: %s is not a USD-quoted pair (EURUSD, GBPUSD...); FX mode covers those only" % sym)
+    if o.get("venue") != "mt5":
+        reasons.append("format: an FX order goes to MT5 (\"venue\": \"mt5\"), got %r" % o.get("venue"))
+    if side not in ("buy", "sell"):
+        reasons.append("format: side must be buy or sell, got %r" % o.get("side"))
+    if typ not in ("market", "limit"):
+        reasons.append("format: an FX order is market or limit, got %r" % typ)
+    if typ == "limit" and _f(o.get("price")) is None:
+        reasons.append("format: an FX limit order needs a price")
+    lots = _f(o.get("volume"))
+    step, vmin = float(spec["volume_step"]), float(spec["volume_min"])
+    if lots is None or lots <= 0:
+        reasons.append("format: volume must be a positive number of lots, got %r" % o.get("volume"))
+        lots = None
+    else:
+        nums["lots"] = lots
+        if abs(lots / step - round(lots / step)) > 1e-6:
+            reasons.append("format: volume %s is not a multiple of the %s-lot step" % (o.get("volume"), step))
+        if lots < vmin - 1e-9:
+            reasons.append("format: volume %s is under the %s-lot minimum" % (o.get("volume"), vmin))
+    if side == "sell" and kind == "entry":
+        reasons.append("short: selling %s you do not hold; this pack trades longs only "
+                       "(an FX close is a ticket.py flatten ticket)" % sym)
+    if kind == "exit":
+        return reasons, later, warns, info, kind, nums
+
+    sl, tp = _f(o.get("sl")), _f(o.get("tp"))
+    plan_entry = _f(plan.get("entry"))
+    live = fresh_price
+    if typ == "limit":
+        ref, ref_from = _f(o.get("price")), "limit"
+    else:
+        cands = [(x, w) for x, w in ((plan_entry, "plan"), (live, "price")) if x]
+        ref, ref_from = max(cands, key=lambda x: x[0]) if cands else (None, None)
+        if live and plan_entry and live > plan_entry + 0.5 * float(spec["point"]):
+            info.append("%s ask %s is above the plan's entry %s: the risk is measured from %s"
+                        % (sym, f(live), f(plan_entry), f(live)))
+    nums.update(stop=sl, target=tp, ref=ref, ref_from=ref_from)
+    if not ref:
+        later.append("price: no entry price for %s (no plan entry, no fresh quote: mt5.py quote %s --write)"
+                     % (sym, sym))
+    if not sl:
+        later.append("stop: no stop loss. Every FX entry needs one (sl), from trader-exit and trader-budget")
+    elif ref:
+        if sl >= ref:
+            later.append("stop: the stop loss %s must be below the entry %s for a buy" % (f(sl), f(ref)))
+        else:
+            pts = int(round((ref - sl) / float(spec["point"])))
+            risk = pts * float(spec["point"])
+            pips = risk / float(spec["pip"])
+            nums["risk"] = round(risk, d)
+            if lots:
+                max_loss = round(lots * float(spec["contract_size"]) * risk, 2)
+                nums["max_loss"] = max_loss
+                cap = _f(c.get("max_loss_per_trade_usd"))
+                if cap and max_loss > cap + CENT:
+                    later.append("loss: %s lots x %.1f pips = %s at the stop, over your %s max loss per trade"
+                                 % (o.get("volume"), pips, money(max_loss), money(cap)))
+            min_rr = _f(c.get("min_reward_risk"))
+            if tp:
+                if tp <= ref:
+                    later.append("target: the take profit %s must be above the entry %s" % (f(tp), f(ref)))
+                else:
+                    rr = round(int(round((tp - ref) / float(spec["point"]))) / float(pts), 2)
+                    nums["rr"] = rr
+                    if min_rr and rr < min_rr - 1e-9:
+                        later.append("reward:risk: %.2f (take profit %s, entry %s, stop %s) is under your minimum %s"
+                                     % (rr, f(tp), f(ref), f(sl), _num(min_rr)))
+            elif min_rr:
+                later.append("reward:risk: no take profit to measure it against (min_reward_risk %s)" % _num(min_rr))
+            info.append("entry %s (%s), stop loss %s, take profit %s: %.1f pips at risk"
+                        % (f(ref), REF_WORDS.get(ref_from, ref_from), f(sl), f(tp) if tp else "none", pips))
+    if lots and ref:
+        max_lots = _f(fx.get("max_lots"))
+        if max_lots and lots > max_lots + 1e-9:
+            later.append("size: %s lots is over your fx.max_lots %s" % (o.get("volume"), _num(max_lots)))
+        notional = lots * float(spec["contract_size"]) * ref
+        nums["notional"] = round(notional, 2)
+        acct = fx_account or {}
+        balance = _f(acct.get("balance")) or _f(c.get("budget"))
+        lev = _f(fx.get("max_leverage_used"))
+        if balance and lev and notional > lev * balance + CENT:
+            later.append("leverage: %s of %s exposure is %.1fx your %s balance, over your fx.max_leverage_used %sx"
+                         % (money(notional), sym[:3], notional / balance, money(balance), _num(lev)))
+        if balance:
+            info.append("exposure %s (%.1fx the %s balance)" % (money(notional), notional / balance, money(balance)))
+    return reasons, later, warns, info, kind, nums
 
 
 def account(cfg, portfolio, prices):
@@ -370,17 +547,22 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          fx_account=None, asks=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its New York date is "today"
-    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh
+    fx_account   trader/mt5/account.json (balance) for FX orders
+    asks         {PAIR: ask} from an MT5 quote; a buy fills at the ask"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
     now_utc = now or parse_now(None)
     now_et = to_eastern(now_utc)
     today = today or now_et.date().isoformat()
+    if not c.get("budget") and not portfolio and _f((fx_account or {}).get("balance")):
+        c["budget"] = float(fx_account["balance"])   # an FX-only setup: the MT5 balance is the account
     acct, top_warn = account(c, portfolio, prices)
     blocked = {str(b).upper() for b in c.get("blocked") or []}
     done_today = placed_today(state, today)
@@ -416,6 +598,64 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         return prices[sym] if -60 <= age <= FRESH_MINUTES * 60 else None
 
     for i, o in enumerate(orders, 1):
+        if isinstance(o, dict) and o.get("market") == "fx":
+            sym = str(o.get("symbol", "")).strip().upper()
+            side = str(o.get("side", "")).strip().lower()
+            live = fresh(sym)
+            if live is not None and asks and asks.get(sym):
+                live = asks[sym]
+            fx = dict(FX_DEFAULTS)
+            fx.update(c.get("fx") or {})
+            reasons, later, warns, info, kind, n = fx_check(o, c, live, fx_account)
+            max_loss = n["max_loss"]
+            if kind == "entry":
+                daily = _f(c.get("max_daily_loss_usd"))
+                if daily and max_loss is not None:
+                    used = loss_today + batch_loss
+                    if used + max_loss > daily + CENT:
+                        later.append("daily loss: %s already at risk today plus %s for this one = %s, over your "
+                                     "%s daily loss limit" % (money(used), money(max_loss), money(used + max_loss),
+                                                              money(daily)))
+                cap_t = int(c.get("max_trades_per_day") or 0)
+                if cap_t and len(entries_today) + batch_entries >= cap_t:
+                    later.append("trades: %d entries placed today plus %d passed earlier in this batch, your "
+                                 "limit is %d a day" % (len(entries_today), batch_entries, cap_t))
+                later.extend(fx_window(now_et, fx))
+                if max_loss is not None:
+                    info.append("max loss %s%s, reward:risk %s; today before this: %d of %s trades, %s of %s "
+                                "daily loss" % (money(max_loss), (" (limit %s)" % money(c["max_loss_per_trade_usd"]))
+                                                if _f(c.get("max_loss_per_trade_usd")) else "",
+                                                ("%.2f" % n["rr"]) if n["rr"] is not None else "n/a",
+                                                len(entries_today) + batch_entries, cap_t or "unlimited",
+                                                money(loss_today + batch_loss), money(daily) if daily else "no limit on"))
+            key = (sym, side)
+            if key in seen:
+                later.append("duplicate: a second %s %s in this batch" % (side, sym))
+            if key in placed_keys:
+                later.append("duplicate: a %s %s was already placed today" % (side, sym))
+            passed_so_far = sum(1 for r in results if r["verdict"] == "PASS")
+            cap_n = int(c.get("max_orders_per_day") or 0)
+            if cap_n and count_today + passed_so_far >= cap_n:
+                later.append("daily limit: %d placed today plus %d passed earlier in this batch, "
+                             "your limit is %d a day" % (count_today, passed_so_far, cap_n))
+            seen.add(key)
+            if kind == "entry":
+                reasons.extend(later)
+            else:
+                warns.extend("exit, not blocked: " + x for x in later)
+            verdict = "BLOCK" if reasons else "PASS"
+            if verdict == "PASS" and kind == "entry":
+                batch_entries += 1
+                batch_loss += max_loss or 0.0
+            results.append({
+                "index": i, "symbol": sym, "side": side, "kind": kind, "market": "fx",
+                "amount": "%s lots" % o.get("volume"), "value_usd": n["notional"],
+                "entry_ref": n["ref"], "entry_ref_from": n["ref_from"], "stop": n["stop"], "target": n["target"],
+                "risk_per_share": n["risk"], "max_loss": max_loss, "reward_risk": n["rr"],
+                "fingerprint": fingerprint(o), "verdict": verdict, "reasons": reasons, "warnings": warns,
+                "info": info,
+            })
+            continue
         reasons, warns, info = [], [], []
         later = []                       # entry-only reasons, turned into warnings for an exit
         sym = str(o.get("symbol", "")).strip().upper()
@@ -700,6 +940,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "block": sum(1 for r in results if r["verdict"] == "BLOCK"),
         "warnings": top_warn,
         "cash_after": round(acct["cash"], 2),
+        "fx_only": bool(results) and all(r.get("market") == "fx" for r in results),
+        "fx_account": {k: (fx_account or {}).get(k) for k in ("mode", "balance", "currency")} if fx_account else None,
         "today": {"orders_placed": count_today, "entries_placed": len(entries_today),
                   "loss_at_risk": round(loss_today, 2), "day_trades_5d": pdt_n if c.get("pdt_guard") else None},
     }
@@ -731,9 +973,15 @@ def report(res):
         for x in r["warnings"]:
             lines.append("        ~ " + x)
     lines.append("")
-    lines.append("%d passed, %d blocked at %s New York. Cash after the passed orders: %s (%s account)."
-                 % (res["pass"], res["block"], res["now_new_york"], money(res["cash_after"]),
-                    "paper" if res["paper"] else "LIVE"))
+    if res.get("fx_only"):
+        acct = res.get("fx_account") or {}
+        lines.append("%d passed, %d blocked at %s New York (MT5 %s account%s). You place FX orders in MT5 yourself."
+                     % (res["pass"], res["block"], res["now_new_york"], (acct.get("mode") or "unknown").upper(),
+                        (", balance %s" % money(acct["balance"])) if acct.get("balance") else ""))
+    else:
+        lines.append("%d passed, %d blocked at %s New York. Cash after the passed orders: %s (%s account)."
+                     % (res["pass"], res["block"], res["now_new_york"], money(res["cash_after"]),
+                        "paper" if res["paper"] else "LIVE"))
     if res["block"]:
         lines.append("Blocked orders do not go to the broker. Fix the order or your rules, then check again.")
     else:
@@ -773,6 +1021,7 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
+    ap.add_argument("--account", default="trader/mt5/account.json", help="MT5 balance, for FX orders")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
@@ -792,7 +1041,10 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        fx_account = read_json(a.account, "MT5 account", required=False)
+        asks = {str(k).upper(): _f(v.get("ask")) for k, v in (pdoc.get("detail") or {}).items()
+                if isinstance(v, dict) and _f(v.get("ask"))}
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, fx_account, asks)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:

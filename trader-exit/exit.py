@@ -191,6 +191,64 @@ def session(d):
     return OPEN, (EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE)
 
 
+# ---------------------------------------------------------------- forex (FX) mode
+
+FX_DEFAULTS = {"pairs": ["EURUSD"], "or_start": "08:00", "or_tz": "London", "or_minutes": 15,
+               "no_entries_after": "15:30", "flat_by": "16:30", "times_tz": "New York",
+               "min_stop_spreads": 3, "min_stop_pips": 3}
+FX_SPEC = {"digits": 5, "point": 0.00001, "pip": 0.0001, "contract_size": 100000.0, "volume_min": 0.01,
+           "volume_step": 0.01, "volume_max": 100.0, "spread": None}   # a standard USD-quoted pair
+FX_PAIR = re.compile(r"^[A-Z]{3}USD$")
+
+
+def _last_sunday(year, month):
+    d = datetime.date(year + (month == 12), month % 12 + 1, 1) - datetime.timedelta(days=1)
+    return d - datetime.timedelta(days=(d.weekday() + 1) % 7)
+
+
+def london_offset(utc):
+    """+1 in UK summer time (1:00 UTC last Sunday of March to last Sunday of October), else 0."""
+    y = utc.year
+    start = datetime.datetime.combine(_last_sunday(y, 3), datetime.time(1, 0))
+    end = datetime.datetime.combine(_last_sunday(y, 10), datetime.time(1, 0))
+    return 1 if start <= utc.replace(tzinfo=None) < end else 0
+
+
+def wall_to_utc(day, t, tz):
+    local = datetime.datetime.combine(day, t)
+    z = str(tz).strip().lower()
+    if z in ("new york", "ny", "et", "america/new_york"):
+        return eastern_to_utc(local)
+    if z in ("london", "uk", "europe/london"):
+        for off in (1, 0):
+            utc = local - datetime.timedelta(hours=off)
+            if london_offset(utc) == off:
+                return utc
+        return local
+    if z in ("utc", "gmt", "z"):
+        return local
+    raise PlanError('fx times want "London", "New York" or "UTC", not %r' % tz)
+
+
+def fx_profile(cfg, sym):
+    fx = dict(FX_DEFAULTS)
+    fx.update((cfg or {}).get("fx") or {})
+    if str(sym).upper() not in [str(p).upper() for p in fx.get("pairs") or []]:
+        return None
+    if not FX_PAIR.match(str(sym).upper()):
+        raise PlanError("%s: FX mode covers USD-quoted pairs only (EURUSD, GBPUSD, AUDUSD...)" % sym)
+    return fx
+
+
+def fx_session(day, fx):
+    """(open, close) New York wall-clock datetimes of the FX day, or None at the weekend."""
+    if day.weekday() >= 5:
+        return None
+    o = to_eastern(wall_to_utc(day, parse_hhmm(fx["or_start"], "fx.or_start"), fx["or_tz"]))
+    c = to_eastern(wall_to_utc(day, parse_hhmm(fx["flat_by"], "fx.flat_by"), fx["times_tz"]))
+    return o, c
+
+
 # ---------------------------------------------------------------- money math (Decimal, to the cent)
 
 def D(x, what="a number"):
@@ -202,17 +260,19 @@ def D(x, what="a number"):
         raise PlanError("%s is not a number: %r" % (what, x))
 
 
-def cents(x):
-    """Round half up to the cent."""
-    return D(x).quantize(CENT, rounding=ROUND_HALF_UP)
+def cents(x, q=CENT):
+    """Round half up to the cent (or to q, a pair's point)."""
+    return D(x).quantize(q, rounding=ROUND_HALF_UP)
 
 
-def floor_cents(x):
+def floor_cents(x, q=CENT):
     """A long's stop: round down, away from the entry."""
-    return D(x).quantize(CENT, rounding=ROUND_FLOOR)
+    return D(x).quantize(q, rounding=ROUND_FLOOR)
 
 
-def money(x):
+def money(x, q=CENT):
+    if q != CENT:
+        return format(D(x).quantize(q), "f")   # a pair's price: 1.12036, no dollar sign
     return "$%s" % format(D(x).quantize(CENT), ",f")
 
 
@@ -268,8 +328,23 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None):
-    """The stop, the target and the risk, in exact cents. Raises PlanError with the reason."""
+            atr=None, atr_bars=None, fx=None):
+    """The stop, the target and the risk, in exact cents (a pair: exact points).
+    fx = {"point", "pip", "spread", "min_stop_spreads", "min_stop_pips"} for a pair.
+    Raises PlanError with the reason."""
+    q = D(fx["point"]) if fx else CENT
+    cur = "" if fx else "$"
+    _c, _f, _m = globals()["cents"], globals()["floor_cents"], globals()["money"]
+
+    def cents(x):
+        return _c(x, q)
+
+    def floor_cents(x):
+        return _f(x, q)
+
+    def money(x):
+        return _m(x, q)
+
     e = cents(entry)
     if e <= 0:
         raise PlanError("the entry price must be above $0")
@@ -283,7 +358,7 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
         if stop_rule == "or_mid":
             raw = (oh + ol) / 2
             label = "opening-range midpoint"
-            detail = "(%s + %s) / 2 = $%s" % (money(oh), money(ol), num(raw))
+            detail = "(%s + %s) / 2 = %s%s" % (money(oh), money(ol), cur, num(raw))
         else:
             raw, label = ol, "opening-range low"
     elif stop_rule == "price":
@@ -291,28 +366,39 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
     elif stop_rule == "pct":
         raw = e * (1 - stop_param / 100)
         label = "%s%% under the entry" % num(stop_param)
-        detail = "%s x (1 - %s%%) = $%s" % (money(e), num(stop_param), num(raw))
+        detail = "%s x (1 - %s%%) = %s%s" % (money(e), num(stop_param), cur, num(raw))
     elif stop_rule == "atr":
         if atr is None:
             raise PlanError("an atr stop needs the session's bars")
         a = D(round(atr, 6))
         raw = e - stop_param * a
         label = "%s x ATR(%d) under the entry" % (num(stop_param), atr_bars)
-        detail = "ATR $%s over the %d bars to the entry%s" % (
-            num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
+        detail = "ATR %s%s over the %d bars to the entry%s" % (
+            cur, num(a.quantize(q / 100 if fx else Decimal("0.0001"))), atr_bars,
+            " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
     stop = floor_cents(raw)
     if stop != D(raw):
-        detail = (detail + ", rounded down" if detail else "$%s rounded down" % num(raw))
+        detail = (detail + ", rounded down" if detail else "%s%s rounded down" % (cur, num(raw)))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
                         % (money(stop), label, money(e)))
     if stop <= 0:
         raise PlanError("the stop works out to %s: pick a stop above $0" % money(stop))
     risk = e - stop
+    if fx:
+        pip = D(fx["pip"])
+        spread = D(fx.get("spread") or 0)
+        need = max(spread * D(fx.get("min_stop_spreads", 3)), pip * D(fx.get("min_stop_pips", 3)))
+        if risk < need:
+            raise PlanError("the stop is %s pips under the entry, under the %s-pip minimum (%s x the %s-pip spread, "
+                            "at least %s pips): too tight, normal wiggle would stop you out. Widen it."
+                            % (num((risk / pip).quantize(Decimal("0.1"))), num((need / pip).quantize(Decimal("0.1"))),
+                               num(D(fx.get("min_stop_spreads", 3))), num((spread / pip).quantize(Decimal("0.1"))),
+                               num(D(fx.get("min_stop_pips", 3)))))
     floor_risk = e * MIN_RISK_PCT / 100
-    if risk < floor_risk:
+    if not fx and risk < floor_risk:
         raise PlanError("the stop is %s under the entry, less than 0.05%% of the price (%s on %s): too tight to "
                         "survive the spread, normal wiggle would stop you out. Widen it."
                         % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
@@ -436,17 +522,23 @@ def load_chart(sym, interval, day, offline=None):
         h, lo = at("high", i), at("low", i)
         bars.append({"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo),
                      "c": float(c)})
-    return {"bars": bars, "data_time": meta.get("regularMarketTime")}
+    return {"bars": bars, "data_time": meta.get("regularMarketTime"), "spec": meta.get("mt5")}
 
 
-def session_bars(chart, day, interval, upto_slot=None, now_utc=None):
-    """Closed, on-grid bars of one New York session, oldest first (the live tick is dropped)."""
+def session_bars(chart, day, interval, upto_slot=None, now_utc=None, fx=None):
+    """Closed, on-grid bars of one New York session (or FX day), oldest first (the live tick is dropped)."""
     step = INTERVALS[interval]
-    s = session(day)
-    if not s:
-        return []
-    open_dt = datetime.datetime.combine(day, s[0])
-    close_dt = datetime.datetime.combine(day, s[1])
+    if fx:
+        s = fx_session(day, fx)
+        if not s:
+            return []
+        open_dt, close_dt = s
+    else:
+        s = session(day)
+        if not s:
+            return []
+        open_dt = datetime.datetime.combine(day, s[0])
+        close_dt = datetime.datetime.combine(day, s[1])
     if now_utc is None and chart.get("data_time"):
         now_utc = utc_of(chart["data_time"])
     local = to_eastern(now_utc) if now_utc else None
@@ -499,11 +591,26 @@ def read_config(path):
         for k in DEFAULTS:
             if doc.get(k) is not None:
                 cfg[k] = doc[k]
+        if isinstance(doc.get("fx"), dict):
+            cfg["fx"] = doc["fx"]
     return cfg
 
 
-def resolve_flat_by(day, explicit, cfg, entry_time):
-    """(HH:MM, note). The config's flat-by moves up with a 1:00 p.m. early close."""
+def resolve_flat_by(day, explicit, cfg, entry_time, fx=None):
+    """(HH:MM, note). The config's flat-by moves up with a 1:00 p.m. early close.
+    A pair's flat-by is fx.flat_by (16:30 New York by default), before the 17:00 rollover."""
+    if fx:
+        s = fx_session(day, fx) if day else None
+        if explicit:
+            t = parse_hhmm(explicit, "--flat-by")
+        elif s:
+            t = s[1].time()
+        else:
+            raise PlanError("%s is a weekend: the FX market is shut" % day)
+        if entry_time and entry_time >= t:
+            raise PlanError("the entry at %s is at or after your flat-by %s: there is no time left to hold it"
+                            % (ampm(entry_time), hm(t)))
+        return hm(t), ""
     t = parse_hhmm(explicit or cfg.get("flat_by") or DEFAULTS["flat_by"], "--flat-by" if explicit else "flat_by")
     note = ""
     s = session(day) if day else None
@@ -554,7 +661,8 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path,
+                "market": doc.get("market"), "spec": doc.get("spec")}
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
     if info["interval"] not in INTERVALS:
@@ -582,21 +690,39 @@ def build_plan(a, now_utc):
     else:
         day = to_eastern(now_utc).date()
     entry_time = parse_clock(info["entry_time"], "the entry time") if info["entry_time"] else None
+    fx = fx_profile(cfg, info["symbol"])
+    if info.get("market") == "fx" and not fx:
+        raise PlanError("%s is an FX entry but %s is not in fx.pairs in the config" % (info["symbol"], info["symbol"]))
+    spec = None
+    chart = None
+    if fx:
+        spec = dict(FX_SPEC)
+        if a.offline and stop_rule != "atr":
+            try:
+                chart = load_chart(info["symbol"], info["interval"], day, a.offline)
+            except PlanError:
+                chart = None
+        spec.update((chart or {}).get("spec") or info.get("spec") or {})
+        fx_math = dict(spec, min_stop_spreads=fx["min_stop_spreads"], min_stop_pips=fx["min_stop_pips"])
     atr = atr_n = None
     if stop_rule == "atr":
         chart = load_chart(info["symbol"], info["interval"], day, a.offline)
-        bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None)
+        if fx and chart.get("spec"):
+            spec.update(chart["spec"])
+            fx_math.update(chart["spec"])
+        bars = session_bars(chart, day, info["interval"], info["entry_bar"], parse_now(a.now) if a.now else None, fx)
         if len(bars) < 3:
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
                             % (info["interval"], info["symbol"], day, len(bars)))
         atr, atr_n = atr_of(bars)
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
-                atr, atr_n)
-    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
+                atr, atr_n, fx_math if fx else None)
+    flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time, fx)
+    q = D(spec["point"]) if fx else CENT
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
-        orr = {"high": float(cents(info["or_high"])), "low": float(cents(info["or_low"])),
-               "minutes": int(info["or_minutes"] or 15)}
+        orr = {"high": float(cents(info["or_high"], q)), "low": float(cents(info["or_low"], q)),
+               "minutes": int(info["or_minutes"] or (fx["or_minutes"] if fx else 15))}
     plan = {"created_by": "trader-exit", "symbol": info["symbol"], "side": "buy", "date": day.isoformat(),
             "setup": info["setup"], "entry": float(c["entry"]),
             "entry_time": ampm(entry_time) if entry_time else None,
@@ -606,8 +732,13 @@ def build_plan(a, now_utc):
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
     if atr is not None:
-        plan["atr"] = round(atr, 4)
+        plan["atr"] = round(atr, 7 if fx else 4)
         plan["atr_bars"] = atr_n
+    if fx:
+        s = fx_session(day, fx)
+        plan.update(market="fx", spec=spec, risk_pips=float((c["risk"] / D(spec["pip"])).quantize(Decimal("0.1"))),
+                    session={"opens": hm(s[0]) if s else None, "closes": flat_by, "tz": "New York",
+                             "range_start": "%s %s" % (fx["or_start"], fx["or_tz"])})
     warnings = []
     if flat_note:
         warnings.append("Flat-by %s: %s." % (flat_by, flat_note))
@@ -625,6 +756,8 @@ def build_plan(a, now_utc):
 
 
 def describe(plan):
+    if plan.get("market") == "fx":
+        return describe_fx(plan)
     day = datetime.date.fromisoformat(plan["date"])
     setup = {"orb": "opening-range breakout", "level": "close above a level"}.get(plan["setup"], plan["setup"])
     e = D(plan["entry"])
@@ -644,6 +777,38 @@ def describe(plan):
     out.append("  Risk a share  %s (%s%% of the entry)" % (money(plan["risk_per_share"]), pct))
     out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
     out.append("  Flat by       %s ET, win or lose: no overnight hold" % plan["flat_by"])
+    out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
+    out.append(NOTE)
+    return out
+
+
+def describe_fx(plan):
+    day = datetime.date.fromisoformat(plan["date"])
+    setup = {"orb": "opening-range breakout", "level": "close above a level"}.get(plan["setup"], plan["setup"])
+    spec = plan.get("spec") or FX_SPEC
+    q = D(spec["point"])
+    pip = D(spec["pip"])
+    risk = D(plan["risk_per_share"])
+    pips = (risk / pip).quantize(Decimal("0.1"))
+    per_lot = (risk * D(spec["contract_size"])).quantize(CENT, rounding=ROUND_HALF_UP)
+    reward = ((D(plan["target"]) - D(plan["entry"])) / pip).quantize(Decimal("0.1"))
+    when = ""
+    if plan.get("entry_time"):
+        when = " at %s ET" % plan["entry_time"]
+        if plan.get("entry_bar") is not None:
+            when += " (bar %d)" % plan["entry_bar"]
+    sess = plan.get("session") or {}
+    out = ["Exit plan: %s long, %s, %s on %s bars (range from the %s open)" % (
+        plan["symbol"], day.strftime("%a %Y-%m-%d"), setup, "5-minute" if plan["interval"] == "5m" else "1-minute",
+        sess.get("range_start") or "FX open")]
+    out.append("  Entry         %s%s" % (money(plan["entry"], q), when))
+    out.append("  Stop          %s  %s%s" % (money(plan["stop"], q), plan["stop_label"],
+                                             (": " + plan["stop_detail"]) if plan.get("stop_detail") else ""))
+    out.append("  Target        %s  %s, %s pips" % (money(plan["target"], q), plan["target_label"], num(reward)))
+    out.append("  Risk          %s pips (%s), $%s a standard lot at the stop" % (
+        num(pips), money(risk, q), format(per_lot, ",f")))
+    out.append("  Reward:risk   %s" % ratio(plan["reward_risk"]))
+    out.append("  Flat by       %s ET, win or lose: before the 17:00 rollover, no overnight swap" % plan["flat_by"])
     out.append("Set before the entry. If price hits the stop, you are out; never move it further away.")
     out.append(NOTE)
     return out
@@ -700,7 +865,7 @@ def main(argv=None):
     p.add_argument("--entry", type=float, help="entry price (or a plan-ahead price with --from)")
     p.add_argument("--or-high", type=float)
     p.add_argument("--or-low", type=float)
-    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--or-minutes", type=int)
     p.add_argument("--setup", choices=["orb", "level"])
     p.add_argument("--date", help="session date YYYY-MM-DD (default: the entry's, or today)")
     p.add_argument("--time", help="entry time, e.g. 10:15 AM")
@@ -711,7 +876,8 @@ def main(argv=None):
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM New York (default: config flat_by, 15:55)")
     p.add_argument("--config", default="trader/config.json")
-    p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
+    p.add_argument("--offline", "--feed", dest="offline", metavar="PATH",
+                   help="saved Yahoo chart JSON for an atr stop (a pair: trader/mt5, for its spec)")
     p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")

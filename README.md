@@ -153,6 +153,31 @@ for the 60 days to October 19 2026, the 10:15 AM opening-range scan, Yahoo's
 TSLA headlines that morning, the House Clerk's 2026 index, real PTR text and
 real XBRL facts. They reproduce every number in the example above.
 
+## Forex: EURUSD on MetaTrader 5
+
+The entry, exit, Time Machine, budget, risk, broker and alerts skills also
+work on EURUSD (and other USD-quoted pairs) with data from a MetaTrader 5
+terminal you are logged into, on Windows:
+
+```bash
+pip install MetaTrader5
+python3 trader-broker/mt5.py account --write                           # demo or real, balance, leverage
+python3 trader-broker/mt5.py export EURUSD --days 60                   # -> trader/mt5/EURUSD.json
+python3 trader-entry/entry.py check EURUSD --feed trader/mt5 --write   # the 08:00 London opening range
+python3 trader-exit/exit.py plan --feed trader/mt5 --write             # stop and target to 5 decimals, in pips
+python3 trader-timemachine/timemachine.py run --feed trader/mt5        # replays London open to 16:30 New York
+python3 trader-budget/size.py --write                                  # lots, sized to your max loss
+python3 trader-risk/check.py                                           # needs "allow_fx": true
+python3 trader-broker/ticket.py show                                   # what to type into MT5
+```
+
+Set `"allow_fx": true` and the `"fx"` block in `trader/config.json` (see
+`config.example.json`): which pairs, the opening range (08:00 London, 15
+minutes), the last entry (15:30 New York), flat by (16:30 New York, before the
+17:00 rollover), `max_lots` and `max_leverage_used`. `mt5.py` only reads MT5.
+Nothing in this pack sends an FX order: you place it in MT5 yourself, after
+trader-risk passes it and you say yes.
+
 ## Fine print
 
 **Not financial advice.** This is software that reads public data and does

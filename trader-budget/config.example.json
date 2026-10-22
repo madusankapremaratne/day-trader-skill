@@ -21,5 +21,19 @@
   "allow_margin": false,
   "allow_short": false,
   "pdt_guard": false,
-  "sec_user_agent": "Your Name you@example.com"
+  "sec_user_agent": "Your Name you@example.com",
+  "allow_fx": false,
+  "fx": {
+    "pairs": ["EURUSD"],
+    "or_start": "08:00",
+    "or_tz": "London",
+    "or_minutes": 15,
+    "no_entries_after": "15:30",
+    "flat_by": "16:30",
+    "times_tz": "New York",
+    "max_lots": 1.0,
+    "max_leverage_used": 10,
+    "min_stop_spreads": 3,
+    "min_stop_pips": 3
+  }
 }
