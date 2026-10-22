@@ -26,6 +26,8 @@ loss small; it does not make a trade win.
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/size.py"                        # trader/plan.json + trader/config.json
 python3 "${CLAUDE_SKILL_DIR}/size.py" --write                # write trader/orders.json

@@ -26,6 +26,8 @@ the scanner does not change that. It only saves you from flipping through
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/scan.py" universe                       # -> trader/universe.txt
 python3 "${CLAUDE_SKILL_DIR}/scan.py" daily                          # before the open -> trader/watchlist.json

@@ -32,6 +32,8 @@ Two yeses from the user, one PASS from the rules. No yes, no order.
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" show                     # every ticket, READY or not
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" approve --index 1 --reply "yes"

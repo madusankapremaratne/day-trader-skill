@@ -28,6 +28,8 @@ keep each loss and each day's losses small. They do not make a trade win.
 
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/check.py"                           # trader/ files; writes trader/state/risk.json
 python3 "${CLAUDE_SKILL_DIR}/check.py" --json

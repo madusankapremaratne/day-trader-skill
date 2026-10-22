@@ -29,6 +29,8 @@ information here: only public filings, read quickly. Say that every time.
 Tool in this folder (standard library Python; `pdftotext` from poppler is
 optional, to read the PDFs locally):
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/ptr.py" --help
 ```

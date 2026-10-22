@@ -24,6 +24,8 @@ trade: what did the last report say, and is the next one inside this trade?
 
 Tool in this folder (standard library Python, no keys):
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/facts.py" --help
 ```

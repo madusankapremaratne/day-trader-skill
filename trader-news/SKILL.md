@@ -23,6 +23,8 @@ headline and a move sit side by side.
 
 Tool in this folder (standard library Python, no keys):
 
+On Windows, if `python3` is not found, run the same commands with `python`.
+
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/news.py"                         # watchlist + plan + portfolio
 python3 "${CLAUDE_SKILL_DIR}/news.py" --tickers TSLA NVDA --hours 12
