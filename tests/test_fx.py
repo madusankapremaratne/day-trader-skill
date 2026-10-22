@@ -226,6 +226,12 @@ class Budget(unittest.TestCase):
         self.assertIsNone(size.fx_order(s))
         self.assertIn("0.01 lots", s["refusal"])
 
+    def test_a_bid_through_the_stop_is_a_refusal(self):
+        s = size.size_fx(fx_plan(), CFG, ACCOUNT, bid=1.12198)
+        self.assertIsNone(size.fx_order(s))
+        self.assertIn("bid 1.12198 is already at or below the stop 1.12198", s["refusal"])
+        self.assertIsNone(size.size_fx(fx_plan(), CFG, ACCOUNT, bid=1.12199)["refusal"])
+
     def test_a_stale_plan_is_refused(self):
         with self.assertRaises(size.SizeError):
             size.size_fx(fx_plan(), CFG, ACCOUNT, today="2026-10-22")
@@ -267,6 +273,16 @@ class Risk(unittest.TestCase):
             self.assertTrue(any(word in x for x in r["results"][0]["reasons"]), (word, r["results"][0]["reasons"]))
         r = self.run_check([cases[1][0]])
         self.assertTrue(any("max_lots" in x for x in r["results"][0]["reasons"]))
+
+    def test_a_bid_through_the_stop_blocks(self):
+        r = check.check([fx_order()], CFG, None, {"EURUSD": 1.12190}, None, None, check.parse_now(NOW), None,
+                        ACCOUNT, {"EURUSD": 1.12192})
+        self.assertEqual(r["block"], 1)
+        self.assertTrue(any("bid 1.12190 is already at or below the stop loss 1.12198" in x
+                            for x in r["results"][0]["reasons"]), r["results"][0]["reasons"])
+        r = check.check([fx_order()], CFG, None, {"EURUSD": 1.12226}, None, None, check.parse_now(NOW), None,
+                        ACCOUNT, {"EURUSD": 1.12228})
+        self.assertEqual(r["pass"], 1, r["results"][0]["reasons"])
 
     def test_leverage(self):
         cfg = dict(CFG, max_loss_per_trade_usd=500, fx=dict(CFG["fx"], max_lots=10, max_leverage_used=1))

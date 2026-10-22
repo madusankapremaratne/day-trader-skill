@@ -387,7 +387,10 @@ def size_trade(plan, cfg, budget=None, limit=None, price=None, cash=None, today=
     cost = round(qty * ref, 2)
     loss = round(qty * risk_c / 100.0, 2)
     refusal = None
-    if qty == 0:
+    if price is not None and round_cent(price) <= stop:
+        refusal = ("%s last %s is already at or below the stop %s: the trade would be stopped out as it opens. "
+                   "No order. Skip it, or make a new plan with trader-exit." % (sym, _price(price), _price(stop)))
+    elif qty == 0:
         if bound[0] == "max loss":
             refusal = ("one share risks %s (entry %s minus stop %s), more than your %s max loss per trade. "
                        "No order. Skip this trade, or plan a closer stop with trader-exit."
@@ -505,11 +508,12 @@ def lot_str(x):
     return "%.2f" % x
 
 
-def size_fx(plan, cfg, account=None, price=None, limit=None, today=None):
+def size_fx(plan, cfg, account=None, price=None, limit=None, today=None, bid=None):
     """Pure function: one FX plan + your rules -> the sizing in lots (qty may be 0).
 
     account  trader/mt5/account.json (balance, leverage), if there is one
-    price    a FRESH ask from trader/prices.json; a market buy is sized at the higher of it and the entry"""
+    price    a FRESH ask from trader/prices.json; a market buy is sized at the higher of it and the entry
+    bid      a FRESH bid: at or below the stop, the trade is already stopped out"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     fx = dict(FX_DEFAULTS)
@@ -592,7 +596,11 @@ def size_fx(plan, cfg, account=None, price=None, limit=None, today=None):
         l["binds"] = l["name"] == bound[0]
     refusal = None
     vmin = float(spec["volume_min"])
-    if lots < vmin - 1e-9:
+    if bid is not None and round(bid, d) <= round(stop, d):
+        refusal = ("%s bid %.*f is already at or below the stop %.*f: the trade would be stopped out as it opens. "
+                   "No order. Skip it, or make a new plan with trader-exit." % (sym, d, bid, d, stop))
+        lots = 0.0
+    elif lots < vmin - 1e-9:
         if bound[0] == "max loss":
             refusal = ("the smallest order, %s lots, loses %s at the stop (%.1f pips), more than your %s max "
                        "loss per trade. No order. Skip it, or plan a closer stop with trader-exit."
@@ -1014,12 +1022,14 @@ def run_plan(a, cfg):
 def run_fx(a, cfg, plan, limit, now, today):
     sym = str(plan.get("symbol") or "").upper()
     d = int((plan.get("spec") or {}).get("digits") or 5)
-    notes, price = [], None
+    notes, price, bid = [], None, None
     ppath = a.prices or ("trader/prices.json" if os.path.exists("trader/prices.json") else None)
     if ppath and limit is None:
         pdoc = read_json(ppath, "prices")
         p, t, fresh = fresh_price(pdoc, sym, now)
         ask = _f((((pdoc or {}).get("detail") or {}).get(sym) or {}).get("ask"))
+        if fresh:
+            bid = p       # MT5's prices.json holds the bid
         p = ask or p      # a buy fills at the ask
         if p is not None and fresh:
             price = p
@@ -1035,7 +1045,7 @@ def run_fx(a, cfg, plan, limit, now, today):
         account = read_json(a.account, "MT5 account")
         notes.append("Balance and leverage from %s (%s, as of %s)." % (
             a.account, (account.get("mode") or "?").upper(), account.get("as_of") or "?"))
-    s = size_fx(plan, cfg, account, price, limit, today)
+    s = size_fx(plan, cfg, account, price, limit, today, bid)
     order = fx_order(s)
     if order and a.write:
         write_orders(a.write, [order], cfg, "trader/plan.json (%s %s %s)" % (sym, s["setup"] or "plan", s["date"]),

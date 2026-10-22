@@ -70,7 +70,7 @@ batch that is fine order by order but breaks a limit together is caught.
 | size | (entries) under `min_order_usd` or over `max_order_usd` |
 | position | (entries) the stock would be over `max_position_pct` of the account |
 | cash | (entries) the buy would leave less than the cash buffer, or need margin |
-| stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry |
+| stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry; a fresh price already at or through the stop (the trade would be stopped out as it opens; for FX, the MT5 bid) |
 | loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_usd` |
 | reward:risk | (entries) (target minus entry) / (entry minus stop) under `min_reward_risk` |
 | daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_usd` |

@@ -189,6 +189,20 @@ class DayTradeChecks(unittest.TestCase):
         res = check.check([tsla()], cfg(), prices={"TSLA": 360.00}, now=at(NOW))
         self.assertEqual(res["results"][0]["entry_ref"], 364.18)
 
+    def test_a_fresh_price_through_the_stop_blocks_the_entry(self):
+        # FXE on 2026-10-22: a trigger at 103.71, stop 103.40, but the live price was 103.36 by then
+        for p in (358.00, 358.32):
+            res = check.check([tsla()], cfg(), prices={"TSLA": p}, now=at(NOW))
+            self.assertEqual(verdicts(res), ["BLOCK"], p)
+            self.assertIn("stop: TSLA last %.2f is already at or below the stop 358.32" % p, reasons(res))
+        self.assertEqual(verdicts(check.check([tsla()], cfg(), prices={"TSLA": 358.33}, now=at(NOW))), ["PASS"])
+
+    def test_a_stale_price_through_the_stop_is_not_used(self):
+        res = check.check([tsla()], cfg(), prices={"TSLA": 358.00}, now=at("2026-10-19 11:30"),
+                          price_times={"TSLA": QUOTE_TIME})
+        self.assertEqual(verdicts(res), ["PASS"])
+        self.assertIn("older than 15 minutes", warnings(res))
+
     def test_a_limit_order_uses_its_limit_price(self):
         o = tsla(type="limit", limit_price="364.00")
         res = check.check([o], cfg(), prices={"TSLA": 366.475}, now=at(NOW))

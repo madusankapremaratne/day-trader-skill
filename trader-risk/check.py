@@ -360,7 +360,7 @@ def fx_window(now_et, fx):
     return []
 
 
-def fx_check(o, c, fresh_price, fx_account=None):
+def fx_check(o, c, fresh_price, fx_account=None, bid=None):
     """One FX order -> (reasons, later, warns, info, kind, numbers). `later` holds the
     entry-only reasons (an exit, a close of an open position, is never blocked by them)."""
     reasons, later, warns, info = [], [], [], []
@@ -427,6 +427,9 @@ def fx_check(o, c, fresh_price, fx_account=None):
     if not sl:
         later.append("stop: no stop loss. Every FX entry needs one (sl), from trader-exit and trader-budget")
     elif ref:
+        if bid is not None and bid <= sl:
+            later.append("stop: %s bid %s is already at or below the stop loss %s: the trade would be stopped out "
+                         "as it opens. Skip it, or make a new plan with trader-exit" % (sym, f(bid), f(sl)))
         if sl >= ref:
             later.append("stop: the stop loss %s must be below the entry %s for a buy" % (f(sl), f(ref)))
         else:
@@ -601,12 +604,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if isinstance(o, dict) and o.get("market") == "fx":
             sym = str(o.get("symbol", "")).strip().upper()
             side = str(o.get("side", "")).strip().lower()
-            live = fresh(sym)
+            live = bid = fresh(sym)            # MT5's prices.json holds the bid: a long is stopped at the bid
             if live is not None and asks and asks.get(sym):
-                live = asks[sym]
+                live = asks[sym]                # and fills at the ask
             fx = dict(FX_DEFAULTS)
             fx.update(c.get("fx") or {})
-            reasons, later, warns, info, kind, n = fx_check(o, c, live, fx_account)
+            reasons, later, warns, info, kind, n = fx_check(o, c, live, fx_account, bid)
             max_loss = n["max_loss"]
             if kind == "entry":
                 daily = _f(c.get("max_daily_loss_usd"))
@@ -827,6 +830,10 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 else:
                     warns.append("no stop: the max loss is not capped, so it is not counted in the daily loss")
             elif ref:
+                if live is not None and ((long and live <= stop + 1e-9) or (not long and live >= stop - 1e-9)):
+                    later.append("stop: %s last %s is already %s the stop %s: the trade would be stopped out as it "
+                                 "opens. Skip it, or make a new plan with trader-exit"
+                                 % (sym, _p(live), "at or below" if long else "at or above", _p(stop)))
                 if (long and stop >= ref - CENT) or (not long and stop <= ref + CENT):
                     later.append("stop: the stop %s must be %s the entry %s for a %s"
                                  % (_p(stop), "below" if long else "above", _p(ref), side))

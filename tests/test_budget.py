@@ -187,6 +187,13 @@ class PlanRules(unittest.TestCase):
         lower = size.size_trade(plan(), cfg(), price=363.00, today=TODAY)
         self.assertEqual((lower["entry"], lower["qty"]), (364.18, 8))
 
+    def test_a_fresh_price_through_the_stop_is_a_refusal(self):
+        for p in (358.10, 358.32):
+            s = size.size_trade(plan(), cfg(), price=p, today=TODAY)
+            self.assertIn("TSLA last %.2f is already at or below the stop 358.32" % p, s["refusal"])
+            self.assertIsNone(size.bracket_order(s))
+        self.assertIsNone(size.size_trade(plan(), cfg(), price=358.33, today=TODAY)["refusal"])
+
     def test_prices_file_is_used_only_when_fresh(self):
         with tempfile.TemporaryDirectory() as d:
             pp = os.path.join(d, "prices.json")

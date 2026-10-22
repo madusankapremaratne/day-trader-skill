@@ -86,8 +86,8 @@ plan's entry, or the price in `trader/prices.json` if it is fresh (under 15
 minutes old) and higher. A price that ran up since the plan means a bigger
 loss at the same stop, so fewer shares. A lower price never shrinks the risk.
 
-It refuses, and writes no order, when: the size is zero shares, the order is
-under the minimum, reward:risk is under `min_reward_risk`, the stop is not
+It refuses, and writes no order, when: the size is zero shares, a fresh price is
+already at or below the stop (for FX, the MT5 bid), the order is under the minimum, reward:risk is under `min_reward_risk`, the stop is not
 below the entry, the target is not above it (the move already happened), the
 plan is for another day, the ticker is blocked, or the plan is a short. Say
 the reason to the user in one line.
